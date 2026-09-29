@@ -5,9 +5,17 @@ pub fn fillBinary(output: []u8) void {
 }
 
 pub fn fillPrintable(output: []u8) void {
-    const first: usize = 32;
-    const count: usize = 95;
-    for (output, 0..) |*byte, i| byte.* = @intCast(first + i % count);
+    for (output, 0..) |*byte, index| {
+        const record_offset = index % 9;
+        if (record_offset == 8) {
+            byte.* = ' ';
+            continue;
+        }
+        const record = index / 9;
+        var divisor: usize = 10_000_000;
+        for (0..record_offset) |_| divisor /= 10;
+        byte.* = @intCast('0' + (record / divisor) % 10);
+    }
 }
 
 pub fn fillRepeated(destination: []u8, pattern: []const u8) void {

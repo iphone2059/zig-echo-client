@@ -13,16 +13,20 @@ pub fn checkedStorageBytes(sessions: usize, batch_bytes: usize, memory_limit: u6
     return total;
 }
 
-pub fn claimAttempts(claimed: *u64, limit: u64, requested: u64) u64 {
+pub fn claimAttempts(claimed: *std.atomic.Value(u64), limit: u64, requested: u64) u64 {
     if (requested == 0) return 0;
     if (limit == 0) {
-        claimed.* +%= requested;
+        _ = claimed.fetchAdd(requested, .monotonic);
         return requested;
     }
-    if (claimed.* >= limit) return 0;
-    const granted = @min(requested, limit - claimed.*);
-    claimed.* += granted;
-    return granted;
+    var observed = claimed.load(.monotonic);
+    while (true) {
+        if (observed >= limit) return 0;
+        const granted = @min(requested, limit - observed);
+        if (claimed.cmpxchgWeak(observed, observed + granted, .monotonic, .monotonic)) |actual| {
+            observed = actual;
+        } else return granted;
+    }
 }
 
 pub fn unclaimedEchoes(limit: u64, claimed: u64, controlled_stop: bool) u64 {
@@ -59,7 +63,7 @@ pub fn notificationMarkRearmed(armed: *bool) bool {
 }
 
 test "claim finite attempts" {
-    var claimed: u64 = 0;
+    var claimed = std.atomic.Value(u64).init(0);
     try std.testing.expectEqual(@as(u64, 4), claimAttempts(&claimed, 5, 4));
     try std.testing.expectEqual(@as(u64, 1), claimAttempts(&claimed, 5, 4));
     try std.testing.expectEqual(@as(u64, 0), claimAttempts(&claimed, 5, 4));
