@@ -26,11 +26,11 @@ fn help() void {
     );
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init) u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
-    var error_buffer: [256]u8 = [_]u8{0} ** 256;
-    const options = options_mod.parse(arena_state.allocator(), &error_buffer) catch {
+    var error_buffer: [256]u8 = @splat(0);
+    const options = options_mod.parse(init.minimal.args, arena_state.allocator(), &error_buffer) catch {
         std.debug.print("Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)});
         help();
         return @intFromEnum(types.ExitCode.usage);

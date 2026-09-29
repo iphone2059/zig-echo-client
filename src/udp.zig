@@ -37,7 +37,7 @@ const Metrics = struct {
     lost: u64 = 0,
     bytes: u64 = 0,
     network_errors: u64 = 0,
-    latency_bins: [64]u64 = [_]u64{0} ** 64,
+    latency_bins: [64]u64 = @splat(0),
     max_us: u64 = 0,
 };
 
@@ -45,7 +45,7 @@ fn resolveIpv4(allocator: std.mem.Allocator, host: []const u8, port: u16, remote
     const host_w = std.unicode.wtf8ToWtf16LeAllocZ(allocator, host) catch return false;
     defer allocator.free(host_w);
     var service_buf: [16]u8 = undefined;
-    const service = std.fmt.bufPrintZ(&service_buf, "{d}", .{port}) catch return false;
+    const service = std.fmt.bufPrint(&service_buf, "{d}", .{port}) catch return false;
     const service_w = std.unicode.wtf8ToWtf16LeAllocZ(allocator, service) catch return false;
     defer allocator.free(service_w);
     var hints: c.ADDRINFOW = std.mem.zeroes(c.ADDRINFOW);
@@ -88,7 +88,7 @@ fn recordLatency(metrics: *Metrics, start: c.LARGE_INTEGER, frequency: c.LARGE_I
     const scaled: u128 = @as(u128, ticks) * 1_000_000;
     const us128: u128 = scaled / freq;
     const capped: u128 = @min(us128, @as(u128, std.math.maxInt(u64)));
-    const us: u64 = @max(@as(u64, 1), @intCast(capped));
+    const us: u64 = @max(@as(u64, 1), @as(u64, @intCast(capped)));
     metrics.latency_bins[latencyBin(us)] += 1;
     metrics.max_us = @max(metrics.max_us, us);
 }

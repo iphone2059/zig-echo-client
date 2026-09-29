@@ -24,13 +24,10 @@ fn fail(buf: []u8, msg: []const u8) ParseError {
     return error.InvalidArguments;
 }
 
-pub fn parse(allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.Options {
-    var it = std.process.argsWithAllocator(allocator) catch return fail(error_buffer, "unable to read command line");
-    defer it.deinit();
-    _ = it.skip();
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    while (it.next()) |arg| argv.append(allocator, arg) catch return fail(error_buffer, "out of memory while parsing arguments");
+pub fn parse(args: std.process.Args, allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.Options {
+    const process_argv = args.toSlice(allocator) catch return fail(error_buffer, "unable to read command line");
+    if (process_argv.len == 0) return fail(error_buffer, "unable to read command line");
+    const argv = process_argv[1..];
 
     var out: types.Options = .{};
     var saw_host = false;
@@ -40,8 +37,8 @@ pub fn parse(allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.
     var saw_printable = false;
 
     var i: usize = 0;
-    while (i < argv.items.len) : (i += 1) {
-        const token = argv.items[i];
+    while (i < argv.len) : (i += 1) {
+        const token = argv[i];
         if (!isSwitch(token)) {
             if (saw_host or token.len == 0 or token.len >= 256) return fail(error_buffer, "client requires exactly one valid target host");
             out.host = token;
@@ -63,7 +60,7 @@ pub fn parse(allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.
             if (eq(name, "h") or eq(name, "help")) out.help = true;
             continue;
         }
-        if (eq(name, "rc") and inline_value == null and (i + 1 >= argv.items.len or isSwitch(argv.items[i + 1]))) {
+        if (eq(name, "rc") and inline_value == null and (i + 1 >= argv.len or isSwitch(argv[i + 1]))) {
             out.reconnect_seconds = 1;
             continue;
         }
@@ -72,9 +69,9 @@ pub fn parse(allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.
             eq(name, "w") or eq(name, "rc") or eq(name, "report") or eq(name, "b") or eq(name, "cq") or eq(name, "memory");
         if (!known) return fail(error_buffer, "unknown switch");
         const value = inline_value orelse blk: {
-            if (i + 1 >= argv.items.len or isSwitch(argv.items[i + 1])) return fail(error_buffer, "switch requires a non-empty value");
+            if (i + 1 >= argv.len or isSwitch(argv[i + 1])) return fail(error_buffer, "switch requires a non-empty value");
             i += 1;
-            break :blk argv.items[i];
+            break :blk argv[i];
         };
 
         if (eq(name, "p")) {
