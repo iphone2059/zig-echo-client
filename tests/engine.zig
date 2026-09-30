@@ -92,6 +92,44 @@ test "client stable context and IOCP notification identities are exact" {
     try std.testing.expect(!internal.notificationPacketMatches(7, &other, 7, &expected));
 }
 
+test "client closes idle CQ with an armed and already queued notification" {
+    var winsock = try win32.Winsock.init();
+    defer winsock.deinit();
+    const api = try rio.Api.load();
+    var owner: engine.WorkerResources = .{};
+    defer owner.completion_queue.deinit();
+    defer owner.port.deinit();
+    owner.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
+    try std.testing.expect(owner.port.value != null);
+    var worker: internal.Worker = .{};
+    worker.resources = @ptrCast(&owner);
+    worker.port = owner.port.value;
+    var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
+    notification.Type = c.RIO_IOCP_COMPLETION;
+    notification.Iocp.IocpHandle = worker.port;
+    notification.Iocp.CompletionKey = @ptrCast(&worker);
+    notification.Iocp.Overlapped = @ptrCast(&worker.notification_overlapped);
+    const cq = api.createCq(8, &notification);
+    try std.testing.expect(cq != c.RIO_INVALID_CQ);
+    owner.completion_queue.reset(&api, cq);
+    worker.completion_queue = cq;
+    try std.testing.expectEqual(@as(c_int, c.ERROR_SUCCESS), api.notify(cq));
+    worker.notification_armed = true;
+    try std.testing.expect(c.PostQueuedCompletionStatus(worker.port, 0, @intFromPtr(&worker), &worker.notification_overlapped) != c.FALSE);
+
+    engine.retireCompletionQueue(&worker);
+
+    try std.testing.expectEqual(c.RIO_INVALID_CQ, worker.completion_queue);
+    try std.testing.expectEqual(c.RIO_INVALID_CQ, owner.completion_queue.value);
+    try std.testing.expect(!worker.notification_armed);
+    var transferred: c.DWORD = 0;
+    var key: usize = 0;
+    var overlapped: [*c]c.OVERLAPPED = null;
+    try std.testing.expect(c.GetQueuedCompletionStatus(worker.port, &transferred, &key, &overlapped, 0) != c.FALSE);
+    try std.testing.expectEqual(@intFromPtr(&worker), key);
+    try std.testing.expect(overlapped == &worker.notification_overlapped);
+}
+
 test "client atomic metrics count beyond 32 bits and percentile boundaries" {
     var metrics: internal.Metrics = .{};
     metrics.echoed.store(@as(u64, 1) << 40, .monotonic);

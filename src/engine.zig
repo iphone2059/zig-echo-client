@@ -365,6 +365,21 @@ fn arm(worker: *Worker) void {
     requireNotificationRearmed(&worker.notification_armed);
 }
 
+pub fn retireCompletionQueue(worker: *Worker) void {
+    if (worker.live_sessions != 0) fail("client CQ retirement with live sessions", c.ERROR_INVALID_STATE);
+    if (worker.sessions) |sessions| {
+        for (sessions[0..worker.session_count]) |session| {
+            if (session.outstanding != 0) fail("client CQ retirement with outstanding operations", c.ERROR_IO_INCOMPLETE);
+        }
+    }
+    const owner = resources(worker);
+    if (worker.completion_queue == c.RIO_INVALID_CQ or owner.completion_queue.value != worker.completion_queue)
+        fail("client CQ retirement ownership", c.ERROR_INVALID_STATE);
+    owner.completion_queue.deinit();
+    worker.completion_queue = c.RIO_INVALID_CQ;
+    worker.notification_armed = false;
+}
+
 fn workerThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
     const worker: *Worker = @ptrCast(@alignCast(parameter.?));
     arm(worker);
@@ -400,16 +415,7 @@ fn workerThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
         processDeadlines(worker);
         if (worker.external_stop.?.load(.acquire)) stopWorker(worker);
     }
-    if (worker.notification_armed) {
-        if (c.PostQueuedCompletionStatus(worker.port, 0, 0, &worker.notification_overlapped) == c.FALSE) fail("PostQueuedCompletionStatus(client notification shutdown)", c.GetLastError());
-        var transferred: c.DWORD = 0;
-        var key: usize = 0;
-        var overlapped: [*c]c.OVERLAPPED = null;
-        const ok = c.GetQueuedCompletionStatus(worker.port, &transferred, &key, &overlapped, 1000);
-        if (ok == c.FALSE) fail("GetQueuedCompletionStatus(client notification shutdown)", c.GetLastError());
-        if (!internal.notificationPacketMatches(key, overlapped, 0, &worker.notification_overlapped)) fail("client notification shutdown packet", c.ERROR_INVALID_DATA);
-        requireNotificationDelivered(&worker.notification_armed);
-    }
+    retireCompletionQueue(worker);
     return if (worker.fatal.?.load(.acquire)) 1 else 0;
 }
 

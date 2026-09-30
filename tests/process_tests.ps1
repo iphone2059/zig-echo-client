@@ -14,12 +14,13 @@ function Get-FreePort {
 
 function Start-Peer([string]$protocol, [int]$port, [string]$mode = 'echo') {
     $ready = Join-Path ([IO.Path]::GetTempPath()) ("zig-client-peer-" + [Guid]::NewGuid().ToString('N') + '.txt')
+    $errorPath = "$ready.stderr"
     $script = Join-Path $PSScriptRoot 'loopback_peer.ps1'
-    $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', "`"$script`"", '-Protocol', $protocol, '-Port', "$port", '-Mode', $mode, '-ReadyPath', "`"$ready`"") -WindowStyle Hidden -PassThru
+    $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', "`"$script`"", '-Protocol', $protocol, '-Port', "$port", '-Mode', $mode, '-ReadyPath', "`"$ready`"") -WindowStyle Hidden -PassThru -RedirectStandardError $errorPath
     $until = [DateTime]::UtcNow.AddSeconds(10)
     while ([DateTime]::UtcNow -lt $until) {
-        if (Test-Path -LiteralPath $ready) { return [pscustomobject]@{ Process = $process; Ready = $ready } }
-        if ($process.HasExited) { throw "peer failed to start: exit=$($process.ExitCode)" }
+        if (Test-Path -LiteralPath $ready) { return [pscustomobject]@{ Process = $process; Ready = $ready; ErrorPath = $errorPath } }
+        if ($process.HasExited) { throw "peer failed to start: protocol=$protocol port=$port mode=$mode exit=$($process.ExitCode) stderr=$(Get-Content -LiteralPath $errorPath -Raw)" }
         Start-Sleep -Milliseconds 25
     }
     if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
@@ -31,7 +32,7 @@ function Stop-Peer($peer) {
     if ($null -ne $peer) {
         if (-not $peer.Process.HasExited) { Stop-Process -Id $peer.Process.Id -Force }
         $peer.Process.Dispose()
-        Remove-Item -LiteralPath $peer.Ready -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $peer.Ready, $peer.ErrorPath -ErrorAction SilentlyContinue
     }
 }
 
