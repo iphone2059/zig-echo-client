@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet('tcp', 'udp')][string]$Protocol,
     [Parameter(Mandatory = $true)][int]$Port,
-    [ValidateSet('echo', 'blackhole', 'close')][string]$Mode = 'echo',
+    [ValidateSet('echo', 'blackhole', 'close', 'fragment')][string]$Mode = 'echo',
     [Parameter(Mandatory = $true)][string]$ReadyPath
 )
 
@@ -28,9 +28,13 @@ if ($Protocol -eq 'udp') {
                 $buffer = [byte[]]::new(65536)
                 while (($length = $socket.Receive($buffer)) -gt 0) {
                     if ($Mode -eq 'close') { break }
+                    if ($Mode -eq 'blackhole') { continue }
                     $offset = 0
                     while ($offset -lt $length) {
-                        $offset += $socket.Send($buffer, $offset, $length - $offset, [System.Net.Sockets.SocketFlags]::None)
+                        $remaining = $length - $offset
+                        $chunk = if ($Mode -eq 'fragment') { [Math]::Max(1, [int]($remaining / 2)) } else { $remaining }
+                        $offset += $socket.Send($buffer, $offset, $chunk, [System.Net.Sockets.SocketFlags]::None)
+                        if ($Mode -eq 'fragment') { Start-Sleep -Milliseconds 1 }
                     }
                 }
             } finally { $socket.Dispose() }
