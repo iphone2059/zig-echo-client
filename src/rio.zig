@@ -5,6 +5,13 @@ const c = win32.c;
 pub const Api = struct {
     table: c.RIO_EXTENSION_FUNCTION_TABLE,
 
+    pub fn tableComplete(table: *const c.RIO_EXTENSION_FUNCTION_TABLE) bool {
+        return table.RIOReceive != null and table.RIOReceiveEx != null and table.RIOSend != null and table.RIOSendEx != null and
+            table.RIOCloseCompletionQueue != null and table.RIOCreateCompletionQueue != null and table.RIOCreateRequestQueue != null and
+            table.RIODequeueCompletion != null and table.RIODeregisterBuffer != null and table.RIONotify != null and
+            table.RIORegisterBuffer != null and table.RIOResizeCompletionQueue != null and table.RIOResizeRequestQueue != null;
+    }
+
     pub fn load() !Api {
         var probe = win32.Socket{ .value = win32.registeredSocket(c.SOCK_STREAM, c.IPPROTO_TCP) };
         defer probe.deinit();
@@ -29,6 +36,7 @@ pub const Api = struct {
             win32.report("SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)", @intCast(c.WSAGetLastError()));
             return error.LoadRio;
         }
+        if (!tableComplete(&table)) return error.InvalidRioTable;
         return .{ .table = table };
     }
 
@@ -87,10 +95,33 @@ pub const Api = struct {
     }
 };
 
+pub const Extensions = struct {
+    rio: Api,
+    connect_ex: ?c.LPFN_CONNECTEX,
+
+    pub fn load() !Extensions {
+        const api = try Api.load();
+        var probe = win32.Socket{ .value = win32.registeredSocket(c.SOCK_STREAM, c.IPPROTO_TCP) };
+        defer probe.deinit();
+        if (probe.value == c.INVALID_SOCKET) return error.ProbeSocket;
+        var identifier = c.WSAID_CONNECTEX;
+        var connect_ex: ?c.LPFN_CONNECTEX = null;
+        var bytes: c.DWORD = 0;
+        if (c.WSAIoctl(probe.value, c.SIO_GET_EXTENSION_FUNCTION_POINTER, &identifier, @sizeOf(c.GUID), @ptrCast(&connect_ex), @sizeOf(?c.LPFN_CONNECTEX), &bytes, null, null) != 0 or connect_ex == null) {
+            win32.report("SIO_GET_EXTENSION_FUNCTION_POINTER(ConnectEx)", @intCast(c.WSAGetLastError()));
+            return error.LoadConnectEx;
+        }
+        return .{ .rio = api, .connect_ex = connect_ex };
+    }
+};
+
 
 pub const Registration = struct {
     api: ?*const Api = null,
     id: c.RIO_BUFFERID = c.RIO_INVALID_BUFFERID,
+
+    pub fn take(self: *Registration) c.RIO_BUFFERID { const value = self.id; self.api = null; self.id = c.RIO_INVALID_BUFFERID; return value; }
+    pub fn reset(self: *Registration, api: ?*const Api, id: c.RIO_BUFFERID) void { self.deinit(); self.api = api; self.id = id; }
 
     pub fn deinit(self: *Registration) void {
         if (self.api) |api| {
@@ -105,6 +136,9 @@ pub const CompletionQueue = struct {
     api: ?*const Api = null,
     value: c.RIO_CQ = c.RIO_INVALID_CQ,
 
+    pub fn take(self: *CompletionQueue) c.RIO_CQ { const value = self.value; self.api = null; self.value = c.RIO_INVALID_CQ; return value; }
+    pub fn reset(self: *CompletionQueue, api: ?*const Api, value: c.RIO_CQ) void { self.deinit(); self.api = api; self.value = value; }
+
     pub fn deinit(self: *CompletionQueue) void {
         if (self.api) |api| {
             if (self.value != c.RIO_INVALID_CQ) api.closeCq(self.value);
@@ -113,3 +147,4 @@ pub const CompletionQueue = struct {
         self.value = c.RIO_INVALID_CQ;
     }
 };
+

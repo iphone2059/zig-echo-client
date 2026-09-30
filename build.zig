@@ -59,4 +59,22 @@ pub fn build(b: *std.Build) void {
     const run_contract_tests = b.addRunArtifact(contract_tests);
     const contract_step = b.step("test-contracts", "Run exact client CLI and payload contracts");
     contract_step.dependOn(&run_contract_tests.step);
+
+    const engine_module = b.createModule(.{
+        .root_source_file = b.path("tests/engine.zig"), .target = target, .optimize = optimize, .link_libc = true,
+    });
+    engine_module.addImport("client", test_module);
+    const engine_tests = b.addTest(.{ .root_module = engine_module });
+    const run_engine_tests = b.addRunArtifact(engine_tests);
+    const stream_module = b.createModule(.{
+        .root_source_file = b.path("tests/stream_driver.zig"), .target = target, .optimize = optimize, .link_libc = true,
+    });
+    stream_module.addImport("client", test_module);
+    const stream_driver = b.addExecutable(.{ .name = "client-stream-driver", .root_module = stream_module });
+    const run_stream = b.addRunArtifact(stream_driver);
+    run_stream.expectStdOutEqual("stdout-only\n");
+    run_stream.expectStdErrEqual("stderr-only\n");
+    const engine_step = b.step("test-engine", "Run client ownership and engine tests");
+    engine_step.dependOn(&run_engine_tests.step);
+    engine_step.dependOn(&run_stream.step);
 }

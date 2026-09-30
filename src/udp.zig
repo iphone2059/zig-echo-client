@@ -31,7 +31,7 @@ const Session = struct {
 };
 
 const Metrics = struct {
-    claimed: u64 = 0,
+    claimed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     echoed: u64 = 0,
     corrupted: u64 = 0,
     lost: u64 = 0,
@@ -68,8 +68,10 @@ fn buildPattern(allocator: std.mem.Allocator, options: *const types.Options) ?[]
         if (options.pattern_kind == .binary_counter) pattern_mod.fillBinary(out) else pattern_mod.fillPrintable(out);
         return out;
     }
-    if (options.pattern_kind == .literal_text) return allocator.dupe(u8, options.literal_pattern) catch null;
-    const out = std.fmt.allocPrint(allocator, "C++ echo from {s}", .{options.host}) catch return null;
+    if (options.pattern_kind == .literal_text) return std.unicode.wtf16LeToWtf8Alloc(allocator, options.literalUtf16()) catch null;
+    const host = std.unicode.wtf16LeToWtf8Alloc(allocator, options.hostUtf16()) catch return null;
+    defer allocator.free(host);
+    const out = std.fmt.allocPrint(allocator, "C++ echo from {s}", .{host}) catch return null;
     return out;
 }
 
@@ -211,7 +213,7 @@ fn printMetrics(label: []const u8, options: *const types.Options, metrics: *cons
             label,
             elapsed_ms,
             options.session_count,
-            metrics.claimed,
+            metrics.claimed.load(.monotonic),
             metrics.echoed,
             metrics.corrupted,
             metrics.lost,
@@ -230,7 +232,9 @@ fn printMetrics(label: []const u8, options: *const types.Options, metrics: *cons
 pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.atomic.Value(bool)) types.ExitCode {
     const allocator = std.heap.page_allocator;
     var remote: c.SOCKADDR_IN = undefined;
-    if (!resolveIpv4(allocator, options.host, options.remote_port, &remote)) return .network;
+    const host = std.unicode.wtf16LeToWtf8Alloc(allocator, options.hostUtf16()) catch return .usage;
+    defer allocator.free(host);
+    if (!resolveIpv4(allocator, host, options.remote_port, &remote)) return .network;
     const pattern = buildPattern(allocator, options) orelse return .network;
     defer allocator.free(pattern);
     if (pattern.len == 0 or pattern.len > types.maximum_udp_payload) return .usage;
@@ -425,7 +429,7 @@ pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.at
     }
     for (sessions) |*s| closeSocket(s);
 
-    const never_claimed = contract.unclaimedEchoes(options.echo_count, metrics.claimed, stopping);
+    const never_claimed = contract.unclaimedEchoes(options.echo_count, metrics.claimed.load(.monotonic), stopping);
     metrics.lost += never_claimed;
     const elapsed = c.GetTickCount64() - start;
     if (!options.quiet or options.stats) printMetrics("final", options, &metrics, elapsed);
