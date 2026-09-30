@@ -29,7 +29,7 @@ pub const c = struct {
     pub const WSA_FLAG_REGISTERED_IO: DWORD = 0x100;
     pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000006;
     pub const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000024;
-    pub const RIO_MSG_WAITALL: DWORD = 0x00000001;
+    pub const RIO_MSG_WAITALL: DWORD = 0x00000004;
     pub const WSAECONNRESET: i32 = 10054;
     pub const ERROR_SUCCESS: DWORD = 0;
     pub const ERROR_NOT_ENOUGH_MEMORY: DWORD = 8;
@@ -53,8 +53,13 @@ pub const c = struct {
     pub const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
 
     pub const WSADATA = extern struct {
-        wVersion: u16, wHighVersion: u16, iMaxSockets: u16, iMaxUdpDg: u16,
-        lpVendorInfo: ?[*:0]u8, szDescription: [257]u8, szSystemStatus: [129]u8,
+        wVersion: u16,
+        wHighVersion: u16,
+        iMaxSockets: u16,
+        iMaxUdpDg: u16,
+        lpVendorInfo: ?[*:0]u8,
+        szDescription: [257]u8,
+        szSystemStatus: [129]u8,
     };
     pub const OVERLAPPED = extern struct {
         Internal: ULONG_PTR,
@@ -114,8 +119,10 @@ pub const c = struct {
     pub const LPFN_CONNECTEX = *const fn (SOCKET, *const SOCKADDR, c_int, ?*const anyopaque, DWORD, ?*DWORD, *OVERLAPPED) callconv(.winapi) BOOL;
     pub const RIO_EXTENSION_FUNCTION_TABLE = extern struct {
         cbSize: DWORD,
-        RIOReceive: ?LPFN_RIORECEIVE, RIOReceiveEx: ?LPFN_RIORECEIVEEX,
-        RIOSend: ?LPFN_RIOSEND, RIOSendEx: ?LPFN_RIOSENDEX,
+        RIOReceive: ?LPFN_RIORECEIVE,
+        RIOReceiveEx: ?LPFN_RIORECEIVEEX,
+        RIOSend: ?LPFN_RIOSEND,
+        RIOSendEx: ?LPFN_RIOSENDEX,
         RIOCloseCompletionQueue: ?LPFN_RIOCLOSECOMPLETIONQUEUE,
         RIOCreateCompletionQueue: ?LPFN_RIOCREATECOMPLETIONQUEUE,
         RIOCreateRequestQueue: ?LPFN_RIOCREATEREQUESTQUEUE,

@@ -125,7 +125,7 @@ pub fn percentile(metrics: *const Metrics, total: u64, numerator: u64, denominat
     var cumulative: u64 = 0;
     for (metrics.latency_bins, 0..) |bin, index| {
         cumulative += bin.load(.monotonic);
-        if (cumulative >= target) return @as(u64, 1) << @intCast(index);
+        if (cumulative >= target) return if (index == 63) std.math.maxInt(u64) else @as(u64, 1) << @intCast(index);
     }
     return @as(u64, 1) << 63;
 }

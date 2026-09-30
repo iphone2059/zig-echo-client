@@ -5,6 +5,14 @@ const rio = client.rio;
 const c = win32.c;
 const internal = client.engine_internal;
 const timer = client.timer_heap;
+const engine = client.engine;
+
+test "client worker partition covers every session without empty workers" {
+    try std.testing.expectEqual(@as(u32, 2), engine.workerCount(2, 8));
+    try std.testing.expectEqual(@as(u32, 3), engine.partitionSessions(10, 3, 0));
+    try std.testing.expectEqual(@as(u32, 3), engine.partitionSessions(10, 3, 1));
+    try std.testing.expectEqual(@as(u32, 4), engine.partitionSessions(10, 3, 2));
+}
 
 test "client Win32 owners transfer reset and destroy exactly once" {
     var socket: win32.Socket = .{};
@@ -25,6 +33,7 @@ test "client Win32 owners transfer reset and destroy exactly once" {
 
 test "client registered sockets require overlapped RIO and ABI is exact" {
     try std.testing.expectEqual(c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO, win32.registeredSocketFlags());
+    try std.testing.expectEqual(@as(u32, 0x00000004), c.RIO_MSG_WAITALL);
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(c.RIO_BUF));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(c.RIORESULT));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(c.OVERLAPPED));
