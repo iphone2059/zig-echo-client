@@ -42,11 +42,11 @@ pub fn build(b: *std.Build) void {
     test_module.linkSystemLibrary("kernel32", .{ .use_pkg_config = .no });
     const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run contract/pattern/heap tests");
+    const test_step = b.step("test", "Run all self-contained client tests");
     test_step.dependOn(&run_tests.step);
 
-    const acceptance_step = b.step("acceptance", "Run the complete client acceptance suite");
-    acceptance_step.dependOn(&run_tests.step);
+    const acceptance_step = b.step("acceptance", "Run the self-contained client acceptance suite");
+    acceptance_step.dependOn(test_step);
 
     const contract_module = b.createModule(.{
         .root_source_file = b.path("tests/contracts.zig"),
@@ -61,13 +61,19 @@ pub fn build(b: *std.Build) void {
     contract_step.dependOn(&run_contract_tests.step);
 
     const engine_module = b.createModule(.{
-        .root_source_file = b.path("tests/engine.zig"), .target = target, .optimize = optimize, .link_libc = true,
+        .root_source_file = b.path("tests/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
     engine_module.addImport("client", test_module);
     const engine_tests = b.addTest(.{ .root_module = engine_module });
     const run_engine_tests = b.addRunArtifact(engine_tests);
     const stream_module = b.createModule(.{
-        .root_source_file = b.path("tests/stream_driver.zig"), .target = target, .optimize = optimize, .link_libc = true,
+        .root_source_file = b.path("tests/stream_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
     stream_module.addImport("client", test_module);
     const stream_driver = b.addExecutable(.{ .name = "client-stream-driver", .root_module = stream_module });
@@ -77,4 +83,26 @@ pub fn build(b: *std.Build) void {
     const engine_step = b.step("test-engine", "Run client ownership and engine tests");
     engine_step.dependOn(&run_engine_tests.step);
     engine_step.dependOn(&run_stream.step);
+
+    const fault_module = b.createModule(.{
+        .root_source_file = b.path("tests/fault_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fault_module.addImport("client", test_module);
+    const fault_driver = b.addExecutable(.{ .name = "zig-echo-client-fault-driver", .root_module = fault_module });
+    b.installArtifact(fault_driver);
+
+    const source_policy = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/source_policy.ps1" });
+    const fault_process = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/fault_process_tests.ps1" });
+    const process_tests = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1" });
+    fault_process.step.dependOn(b.getInstallStep());
+    process_tests.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_contract_tests.step);
+    test_step.dependOn(&run_engine_tests.step);
+    test_step.dependOn(&run_stream.step);
+    test_step.dependOn(&source_policy.step);
+    test_step.dependOn(&fault_process.step);
+    test_step.dependOn(&process_tests.step);
 }

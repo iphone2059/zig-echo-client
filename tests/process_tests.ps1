@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory = $true)][string]$ClientPath
+    [string]$ClientPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'zig-out\bin\zig-echo-client.exe')
 )
 
 $ErrorActionPreference = 'Stop'
