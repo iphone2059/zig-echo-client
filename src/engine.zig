@@ -547,14 +547,14 @@ fn resolveIpv4(options: *const types.Options, remote: *c.SOCKADDR_IN) bool {
     return true;
 }
 
-fn buildPattern(options: *const types.Options) ?[]u8 {
+pub fn buildPattern(options: *const types.Options) ?[]u8 {
     if (options.pattern_kind == .binary_counter or options.pattern_kind == .printable_counter) {
         const output = allocator.alloc(u8, options.pattern_bytes) catch return null;
         if (options.pattern_kind == .binary_counter) pattern_mod.fillBinary(output) else pattern_mod.fillPrintable(output);
         return output;
     }
-    if (options.pattern_kind == .literal_text) return std.unicode.wtf16LeToWtf8Alloc(allocator, options.literalUtf16()) catch null;
-    const host = std.unicode.wtf16LeToWtf8Alloc(allocator, options.hostUtf16()) catch return null;
+    if (options.pattern_kind == .literal_text) return std.unicode.utf16LeToUtf8Alloc(allocator, options.literalUtf16()) catch null;
+    const host = std.unicode.utf16LeToUtf8Alloc(allocator, options.hostUtf16()) catch return null;
     defer allocator.free(host);
     return std.fmt.allocPrint(allocator, "C++ echo from {s}", .{host}) catch null;
 }
@@ -584,12 +584,28 @@ pub fn runClient(options: *const types.Options, stop: *std.atomic.Value(bool)) t
     const extensions = rio.Extensions.load() catch return .network;
     var remote: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
     if (!resolveIpv4(options, &remote)) return .network;
-    const pattern = buildPattern(options) orelse return .usage;
+    const pattern = buildPattern(options) orelse {
+        win32.report("payload pattern", c.ERROR_INVALID_DATA);
+        return .usage;
+    };
     defer allocator.free(pattern);
-    if (pattern.len == 0 or (options.protocol == .udp and pattern.len > types.maximum_udp_payload)) return .usage;
+    if (pattern.len == 0 or (options.protocol == .udp and pattern.len > types.maximum_udp_payload)) {
+        win32.report("payload pattern", c.ERROR_INVALID_DATA);
+        return .usage;
+    }
     const depth: usize = if (options.protocol == .tcp) options.pipeline_depth else 1;
-    const maximum_attempt_bytes = contract.checkedProduct(pattern.len, depth) orelse return .usage;
-    if (maximum_attempt_bytes > types.maximum_tcp_batch_bytes or contract.checkedStorageBytes(options.session_count, maximum_attempt_bytes, options.memory_bytes) == null) return .usage;
+    const maximum_attempt_bytes = contract.checkedProduct(pattern.len, depth) orelse {
+        win32.report("payload batch size", c.ERROR_ARITHMETIC_OVERFLOW);
+        return .usage;
+    };
+    if (maximum_attempt_bytes > types.maximum_tcp_batch_bytes) {
+        win32.report("payload batch size", c.ERROR_ARITHMETIC_OVERFLOW);
+        return .usage;
+    }
+    if (contract.checkedStorageBytes(options.session_count, maximum_attempt_bytes, options.memory_bytes) == null) {
+        win32.report("registered storage /memory limit", c.ERROR_NOT_ENOUGH_MEMORY);
+        return .usage;
+    }
     const count = workerCount(options.session_count, options.worker_count);
     const workers = allocator.alloc(Worker, count) catch return .network;
     defer allocator.free(workers);

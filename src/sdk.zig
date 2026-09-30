@@ -35,6 +35,7 @@ pub const c = struct {
     pub const ERROR_NOT_ENOUGH_MEMORY: DWORD = 8;
     pub const ERROR_INVALID_DATA: DWORD = 13;
     pub const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
+    pub const ERROR_ARITHMETIC_OVERFLOW: DWORD = 534;
     pub const WAIT_TIMEOUT: DWORD = 258;
     pub const WAIT_OBJECT_0: DWORD = 0;
     pub const ERROR_IO_PENDING: DWORD = 997;

@@ -13,8 +13,12 @@ fn writeAll(handle: c.HANDLE, bytes: []const u8) bool {
     return true;
 }
 
-pub fn writeStdout(bytes: []const u8) bool { return writeAll(c.GetStdHandle(c.STD_OUTPUT_HANDLE), bytes); }
-pub fn writeStderr(bytes: []const u8) bool { return writeAll(c.GetStdHandle(c.STD_ERROR_HANDLE), bytes); }
+pub fn writeStdout(bytes: []const u8) bool {
+    return writeAll(c.GetStdHandle(c.STD_OUTPUT_HANDLE), bytes);
+}
+pub fn writeStderr(bytes: []const u8) bool {
+    return writeAll(c.GetStdHandle(c.STD_ERROR_HANDLE), bytes);
+}
 
 pub fn report(stage: []const u8, native_error: u32) void {
     var buffer: [512]u8 = undefined;
@@ -33,7 +37,11 @@ pub const Winsock = struct {
 
     pub fn init() !Winsock {
         var data: c.WSADATA = undefined;
-        if (c.WSAStartup(0x0202, &data) != 0) return error.WsaStartup;
+        const status = c.WSAStartup(0x0202, &data);
+        if (status != 0) {
+            report("WSAStartup", @intCast(status));
+            return error.WsaStartup;
+        }
         return .{ .started = true };
     }
 
@@ -48,7 +56,9 @@ pub const Winsock = struct {
 pub const Socket = struct {
     value: c.SOCKET = c.INVALID_SOCKET,
 
-    pub fn get(self: *const Socket) c.SOCKET { return self.value; }
+    pub fn get(self: *const Socket) c.SOCKET {
+        return self.value;
+    }
 
     pub fn deinit(self: *Socket) void {
         if (self.value != c.INVALID_SOCKET) {
@@ -63,13 +73,18 @@ pub const Socket = struct {
         return value;
     }
 
-    pub fn reset(self: *Socket, value: c.SOCKET) void { self.deinit(); self.value = value; }
+    pub fn reset(self: *Socket, value: c.SOCKET) void {
+        self.deinit();
+        self.value = value;
+    }
 };
 
 pub const Handle = struct {
     value: c.HANDLE = null,
 
-    pub fn get(self: *const Handle) c.HANDLE { return self.value; }
+    pub fn get(self: *const Handle) c.HANDLE {
+        return self.value;
+    }
 
     pub fn deinit(self: *Handle) void {
         if (self.value != null and self.value != c.INVALID_HANDLE_VALUE) {
@@ -78,8 +93,15 @@ pub const Handle = struct {
         }
     }
 
-    pub fn take(self: *Handle) c.HANDLE { const value = self.value; self.value = null; return value; }
-    pub fn reset(self: *Handle, value: c.HANDLE) void { self.deinit(); self.value = value; }
+    pub fn take(self: *Handle) c.HANDLE {
+        const value = self.value;
+        self.value = null;
+        return value;
+    }
+    pub fn reset(self: *Handle, value: c.HANDLE) void {
+        self.deinit();
+        self.value = value;
+    }
 };
 
 pub const ThreadHandle = Handle;
@@ -98,8 +120,15 @@ pub const VirtualMemory = struct {
         return @ptrCast(self.ptr.?);
     }
 
-    pub fn take(self: *VirtualMemory) ?*anyopaque { const value = self.ptr; self.ptr = null; return value; }
-    pub fn reset(self: *VirtualMemory, value: ?*anyopaque) void { self.deinit(); self.ptr = value; }
+    pub fn take(self: *VirtualMemory) ?*anyopaque {
+        const value = self.ptr;
+        self.ptr = null;
+        return value;
+    }
+    pub fn reset(self: *VirtualMemory, value: ?*anyopaque) void {
+        self.deinit();
+        self.ptr = value;
+    }
 
     pub fn deinit(self: *VirtualMemory) void {
         if (self.ptr) |p| {
@@ -113,7 +142,9 @@ pub fn registeredSocket(socket_type: c_int, protocol: c_int) c.SOCKET {
     return c.WSASocketW(c.AF_INET, socket_type, protocol, null, 0, registeredSocketFlags());
 }
 
-pub fn registeredSocketFlags() c.DWORD { return c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO; }
+pub fn registeredSocketFlags() c.DWORD {
+    return c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO;
+}
 
 pub fn configureSocket(socket_value: c.SOCKET, socket_buffer_bytes: u32, tcp: bool) bool {
     if (socket_buffer_bytes != 0) {
@@ -136,4 +167,3 @@ pub fn configureSocket(socket_value: c.SOCKET, socket_buffer_bytes: u32, tcp: bo
     }
     return true;
 }
-

@@ -26,7 +26,24 @@ test "client rejects empty values conflicts and malformed WTF-8" {
     try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/r=" }, &options, &error_buffer));
     try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/l", "40000", "/rc" }, &options, &error_buffer));
     try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "udp", "/k", "2" }, &options, &error_buffer));
-    try std.testing.expect(!parse(&.{ &.{ 0xff }, "/p", "tcp" }, &options, &error_buffer));
+    try std.testing.expect(!parse(&.{ &.{0xff}, "/p", "tcp" }, &options, &error_buffer));
+    try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/d", "" }, &options, &error_buffer));
+    try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/n", "+1" }, &options, &error_buffer));
+    try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/n", "1_0" }, &options, &error_buffer));
+    try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/rc", "-1" }, &options, &error_buffer));
+    try std.testing.expectEqualStrings("numeric switch has an invalid value", std.mem.sliceTo(&error_buffer, 0));
+    try std.testing.expect(parse(&.{ "/127.0.0.1", "/p", "tcp" }, &options, &error_buffer));
+    try std.testing.expect(parse(&.{ "-1", "/p", "tcp" }, &options, &error_buffer));
+}
+
+test "client strict UTF-16 payload conversion rejects surrogate halves" {
+    var options: client.types.Options = .{ .pattern_kind = .literal_text, .literal_len = 1 };
+    options.literal_pattern[0] = 0xd800;
+    try std.testing.expect(client.engine.buildPattern(&options) == null);
+    options = .{};
+    options.host[0] = 0xd800;
+    options.host_len = 1;
+    try std.testing.expect(client.engine.buildPattern(&options) == null);
 }
 
 test "client payload generation matches C++ records and wrap" {

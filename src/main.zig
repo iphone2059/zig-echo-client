@@ -16,12 +16,12 @@ fn consoleHandler(kind: c.DWORD) callconv(.winapi) c.BOOL {
 }
 
 fn help() void {
-    std.debug.print(
-        "Usage: zig-echo-client target /p tcp|udp [/r port] [/l port] [/n count] [/t seconds]\n" ++
-            "       [/i ms] [/d text | /z bytes | /zt bytes] [/k depth] [/c sessions] [/threads workers]\n" ++
-            "       [/w seconds] [/rc [seconds]] [/report seconds] [/b bytes] [/cq capacity]\n" ++
-            "       [/memory bytes] [/q] [/stats]\n",
-        .{},
+    _ = win32.writeStdout(
+        "Usage: zig-echo-client target /p tcp|udp [/r port] [/l port] [/n count]\n" ++
+            "       [/t seconds] [/i ms] [/d text | /z bytes | /zt bytes] [/k tcp-depth]\n" ++
+            "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]\n" ++
+            "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
+            "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n",
     );
 }
 
@@ -40,7 +40,10 @@ pub fn main(init: std.process.Init) u8 {
         return 0;
     }
     stop_requested.store(false, .release);
-    if (c.SetConsoleCtrlHandler(consoleHandler, c.TRUE) == c.FALSE) return @backingInt(types.ExitCode.internal);
+    if (c.SetConsoleCtrlHandler(consoleHandler, c.TRUE) == c.FALSE) {
+        win32.report("SetConsoleCtrlHandler", c.GetLastError());
+        return @backingInt(types.ExitCode.internal);
+    }
     defer _ = c.SetConsoleCtrlHandler(consoleHandler, c.FALSE);
     return @backingInt(engine.runClient(&options, &stop_requested));
 }

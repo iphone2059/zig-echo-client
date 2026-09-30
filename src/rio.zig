@@ -15,7 +15,10 @@ pub const Api = struct {
     pub fn load() !Api {
         var probe = win32.Socket{ .value = win32.registeredSocket(c.SOCK_STREAM, c.IPPROTO_TCP) };
         defer probe.deinit();
-        if (probe.value == c.INVALID_SOCKET) return error.ProbeSocket;
+        if (probe.value == c.INVALID_SOCKET) {
+            win32.report("WSASocketW(RIO probe)", @intCast(c.WSAGetLastError()));
+            return error.ProbeSocket;
+        }
 
         var table: c.RIO_EXTENSION_FUNCTION_TABLE = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE);
         table.cbSize = @intCast(@sizeOf(c.RIO_EXTENSION_FUNCTION_TABLE));
@@ -103,7 +106,10 @@ pub const Extensions = struct {
         const api = try Api.load();
         var probe = win32.Socket{ .value = win32.registeredSocket(c.SOCK_STREAM, c.IPPROTO_TCP) };
         defer probe.deinit();
-        if (probe.value == c.INVALID_SOCKET) return error.ProbeSocket;
+        if (probe.value == c.INVALID_SOCKET) {
+            win32.report("WSASocketW(ConnectEx probe)", @intCast(c.WSAGetLastError()));
+            return error.ProbeSocket;
+        }
         var identifier = c.WSAID_CONNECTEX;
         var connect_ex: ?c.LPFN_CONNECTEX = null;
         var bytes: c.DWORD = 0;
@@ -115,13 +121,21 @@ pub const Extensions = struct {
     }
 };
 
-
 pub const Registration = struct {
     api: ?*const Api = null,
     id: c.RIO_BUFFERID = c.RIO_INVALID_BUFFERID,
 
-    pub fn take(self: *Registration) c.RIO_BUFFERID { const value = self.id; self.api = null; self.id = c.RIO_INVALID_BUFFERID; return value; }
-    pub fn reset(self: *Registration, api: ?*const Api, id: c.RIO_BUFFERID) void { self.deinit(); self.api = api; self.id = id; }
+    pub fn take(self: *Registration) c.RIO_BUFFERID {
+        const value = self.id;
+        self.api = null;
+        self.id = c.RIO_INVALID_BUFFERID;
+        return value;
+    }
+    pub fn reset(self: *Registration, api: ?*const Api, id: c.RIO_BUFFERID) void {
+        self.deinit();
+        self.api = api;
+        self.id = id;
+    }
 
     pub fn deinit(self: *Registration) void {
         if (self.api) |api| {
@@ -136,8 +150,17 @@ pub const CompletionQueue = struct {
     api: ?*const Api = null,
     value: c.RIO_CQ = c.RIO_INVALID_CQ,
 
-    pub fn take(self: *CompletionQueue) c.RIO_CQ { const value = self.value; self.api = null; self.value = c.RIO_INVALID_CQ; return value; }
-    pub fn reset(self: *CompletionQueue, api: ?*const Api, value: c.RIO_CQ) void { self.deinit(); self.api = api; self.value = value; }
+    pub fn take(self: *CompletionQueue) c.RIO_CQ {
+        const value = self.value;
+        self.api = null;
+        self.value = c.RIO_INVALID_CQ;
+        return value;
+    }
+    pub fn reset(self: *CompletionQueue, api: ?*const Api, value: c.RIO_CQ) void {
+        self.deinit();
+        self.api = api;
+        self.value = value;
+    }
 
     pub fn deinit(self: *CompletionQueue) void {
         if (self.api) |api| {
@@ -147,4 +170,3 @@ pub const CompletionQueue = struct {
         self.value = c.RIO_INVALID_CQ;
     }
 };
-

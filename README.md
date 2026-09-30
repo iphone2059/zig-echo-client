@@ -3,6 +3,7 @@
 Independent Windows TCP/UDP echo client rewritten from `cpp-echo-client` in Zig. All payload operations use Winsock Registered I/O (RIO). Each fixed worker owns one RIO completion queue, its IOCP notification port, registered arena, sessions, request queues, and timer heap. IOCP also receives TCP `ConnectEx` completions and worker stop packets. There is no ordinary `send`/`recv`, `WSAPoll`, `select`, or `std.net` fallback.
 
 The client owns its Win32/RIO/ConnectEx ABI declarations and has no source or build dependency on any server or sibling project. Interoperability tests accept a separately built server executable path.
+This pinned Zig 0.17-dev snapshot has removed `@cImport`, so the private native declarations are checked against a Microsoft SDK-compiled ABI probe (sizes, offsets, and constants) in the default test suite.
 
 ## Toolchain and build
 
@@ -47,7 +48,7 @@ Each connected UDP session owns one RIO request queue. It posts a receive and se
 
 ## Verification
 
-The default build suite is self-contained: parser/payload contracts, heap model, native ABI/ownership checks, local TCP/UDP process cases (including 65507-byte datagrams, fragmented TCP echoes, reconnect, timeout, and cancellation drain), deterministic exit-4 fault guards, and source-policy checks.
+The default build suite is self-contained: parser/payload contracts, heap model, Microsoft SDK ABI/ownership checks, local TCP/UDP process cases (including 65507-byte datagrams, fragmented TCP echoes, reconnect, timeout, run-duration and externally requested cancellation drain), deterministic exit-4 fault guards, and source-policy checks.
 
 To test this client against an independently built C++ or Zig server, pass the executable explicitly:
 

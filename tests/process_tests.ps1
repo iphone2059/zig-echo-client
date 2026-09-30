@@ -35,7 +35,7 @@ function Stop-Peer($peer) {
     }
 }
 
-function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$required) {
+function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$required, [string[]]$requiredStderr = @()) {
     $id = [Guid]::NewGuid().ToString('N')
     $stdout = Join-Path ([IO.Path]::GetTempPath()) "zig-client-$id-out.txt"
     $stderr = Join-Path ([IO.Path]::GetTempPath()) "zig-client-$id-err.txt"
@@ -48,11 +48,16 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
         }
         $out = Get-Content -LiteralPath $stdout -Raw
         $err = Get-Content -LiteralPath $stderr -Raw
+        if ($null -eq $out) { $out = '' }
+        if ($null -eq $err) { $err = '' }
         if ($process.ExitCode -ne $expectedExit) {
             throw "client exit=$($process.ExitCode), expected=$expectedExit; args=$($arguments -join ' '); stdout=$out stderr=$err"
         }
         foreach ($field in $required) {
             if (-not $out.Contains($field)) { throw "missing '$field'; args=$($arguments -join ' '); stdout=$out stderr=$err" }
+        }
+        foreach ($field in $requiredStderr) {
+            if (-not $err.Contains($field)) { throw "missing stderr '$field'; args=$($arguments -join ' '); stdout=$out stderr=$err" }
         }
         if ($expectedExit -eq 0 -and -not [string]::IsNullOrEmpty($err)) { throw "unexpected stderr: $err" }
         return $out
@@ -61,6 +66,9 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
         Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
     }
 }
+
+[void](Invoke-Client @('/h') 0 @('Usage: zig-echo-client target /p tcp|udp', 'Data I/O is always RIO'))
+[void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/d', '') 1 @('Usage: zig-echo-client target /p tcp|udp') @('Invalid arguments:'))
 
 $port = Get-FreePort
 $peer = Start-Peer 'udp' $port
@@ -102,6 +110,20 @@ $peer = Start-Peer 'tcp' $port 'blackhole'
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '0', '/c', '1', '/k', '8', '/z', '4096', '/t', '3', '/w', '1', '/stats') 0 @('final ', 'corrupted=0', 'lost=0', 'latency_sample=batch'))
 } finally { Stop-Peer $peer }
+
+$forcedStopDriver = Join-Path (Split-Path -Parent $client) 'zig-echo-client-external-stop-driver.exe'
+if (-not (Test-Path -LiteralPath $forcedStopDriver -PathType Leaf)) { throw "Missing forced-stop driver: $forcedStopDriver" }
+$port = Get-FreePort
+$peer = Start-Peer 'tcp' $port 'blackhole'
+try {
+    $previousClient = $client
+    $client = $forcedStopDriver
+    [void](Invoke-Client @("$port") 0 @('final ', 'echoed=0', 'corrupted=0', 'lost=0', 'network_errors=0'))
+    $client = $previousClient
+} finally {
+    $client = $previousClient
+    Stop-Peer $peer
+}
 
 $port = Get-FreePort
 $id = [Guid]::NewGuid().ToString('N')

@@ -6,9 +6,14 @@ fn eq(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 fn isSwitch(token: []const u8) bool {
-    return token.len >= 2 and (token[0] == '/' or token[0] == '-');
+    if (token.len < 2 or (token[0] != '/' and token[0] != '-')) return false;
+    const offset: usize = if (token.len > 2 and token[0] == '-' and token[1] == '-') 2 else 1;
+    if (offset >= token.len) return false;
+    return std.ascii.isAlphabetic(token[offset]);
 }
 fn number(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+    for (text) |character| if (character < '0' or character > '9') return null;
     return std.fmt.parseInt(u64, text, 10) catch null;
 }
 fn setError(buffer: []u8, message: []const u8) void {
@@ -81,6 +86,10 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             index += 1;
             break :value argv[index];
         };
+        if (value.len == 0) {
+            setError(error_buffer, "switch requires a non-empty value");
+            return false;
+        }
         if (eq(name, "p")) {
             if (eq(value, "tcp")) out.protocol = .tcp else if (eq(value, "udp")) out.protocol = .udp else {
                 setError(error_buffer, "/p requires tcp or udp");
