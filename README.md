@@ -8,7 +8,7 @@ This pinned Zig 0.17-dev snapshot has removed `@cImport`, so the private native 
 ## Toolchain and build
 
 - Windows x64 and MSVC ABI
-- Zig `0.17.0-dev.2320+1e770dbef`
+- Zig `0.17.0-dev.2375+d8aab4878`
 - Visual Studio C++ tools and Windows SDK
 - PowerShell 7 for process tests
 

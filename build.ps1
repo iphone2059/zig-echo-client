@@ -5,8 +5,8 @@ param(
     [switch]$BuildOnly
 )
 $ErrorActionPreference = 'Stop'
-$requiredVersion = '0.17.0-dev.2320+1e770dbef'
-$pinnedZig = 'C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe'
+$requiredVersion = '0.17.0-dev.2375+d8aab4878'
+$pinnedZig = 'C:\bin\zig-x86_64-windows-0.17.0-dev.2375+d8aab4878\zig.exe'
 if (-not $ZigPath) {
     if ($env:ZIG_EXE) {
         $ZigPath = $env:ZIG_EXE
