@@ -7,6 +7,7 @@ pub const sdk = @import("sdk.zig");
 pub const win32 = @import("win32.zig");
 pub const rio = @import("rio.zig");
 pub const engine_internal = @import("engine_internal.zig");
+pub const client_session = @import("client_session.zig");
 pub const engine = @import("engine.zig");
 pub const bench_histogram = @import("bench_histogram.zig");
 test {
@@ -19,6 +20,7 @@ test {
     _ = win32;
     _ = rio;
     _ = engine_internal;
+    _ = client_session;
     _ = engine;
     _ = bench_histogram;
 }

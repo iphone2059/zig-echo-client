@@ -6,6 +6,128 @@ const c = win32.c;
 const internal = client.engine_internal;
 const timer = client.timer_heap;
 const engine = client.engine;
+const session_machine = client.client_session;
+
+var last_reposted_offset: u32 = 0;
+var last_reposted_length: u32 = 0;
+fn fakeSend(_: c.RIO_RQ, buffers: [*c]c.RIO_BUF, count: c.ULONG, _: c.DWORD, _: ?*anyopaque) callconv(.winapi) c.BOOL {
+    if (count != 1) return c.FALSE;
+    last_reposted_offset = buffers[0].Offset;
+    last_reposted_length = buffers[0].Length;
+    return c.TRUE;
+}
+
+test "client partial RIOSend completion reposts only the unsent tail" {
+    var api: rio.Api = .{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) };
+    api.table.RIOSend = fakeSend;
+    var worker: internal.Worker = .{};
+    var sessions: [1]internal.Session = .{.{}};
+    worker.rio_api = &api;
+    worker.sessions = &sessions;
+    worker.session_count = 1;
+    worker.maximum_attempt_bytes = 100;
+    sessions[0].owner = &worker;
+    sessions[0].state = .active;
+    sessions[0].attempt_bytes = 100;
+    sessions[0].outstanding = 2;
+    sessions[0].send_request.session = &sessions[0];
+    sessions[0].send_request.operation = .send;
+    session_machine.processRioResult(&worker, .{
+        .Status = c.ERROR_SUCCESS,
+        .BytesTransferred = 40,
+        .SocketContext = null,
+        .RequestContext = @ptrCast(&sessions[0].send_request),
+    });
+    try std.testing.expectEqual(@as(usize, 40), sessions[0].send_offset);
+    try std.testing.expectEqual(@as(u32, 40), last_reposted_offset);
+    try std.testing.expectEqual(@as(u32, 60), last_reposted_length);
+    try std.testing.expectEqual(@as(u32, 2), sessions[0].outstanding);
+}
+
+test "client 17 logical echoes at pipeline 8 claim batches of 8 8 and 1" {
+    var claimed = std.atomic.Value(u64).init(0);
+    const first = client.contract.claimAttempts(&claimed, 17, 8);
+    const second = client.contract.claimAttempts(&claimed, 17, 8);
+    const third = client.contract.claimAttempts(&claimed, 17, 8);
+    try std.testing.expectEqual(@as(u64, 8), first);
+    try std.testing.expectEqual(@as(u64, 8), second);
+    try std.testing.expectEqual(@as(u64, 1), third);
+    try std.testing.expectEqual(@as(u64, 0), client.contract.claimAttempts(&claimed, 17, 8));
+    try std.testing.expectEqual(@as(u64, 17 * 4096), (first + second + third) * 4096);
+}
+
+test "client close waits for both posted send and receive completions" {
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const heap = try timer.Heap.init(&nodes, &positions);
+    var sockets: [1]win32.Socket = .{.{}};
+    var owner: internal.WorkerResources = .{ .session_sockets = &sockets };
+    var worker: internal.Worker = .{};
+    var sessions: [1]internal.Session = .{.{}};
+    worker.resources = &owner;
+    worker.sessions = &sessions;
+    worker.session_count = 1;
+    worker.live_sessions = 1;
+    worker.timers = heap;
+    sessions[0].owner = &worker;
+    sessions[0].state = .active;
+    sessions[0].outstanding = 2;
+    sessions[0].send_request.session = &sessions[0];
+    sessions[0].receive_request.session = &sessions[0];
+    session_machine.closeAttempt(&sessions[0], false);
+    try std.testing.expectEqual(internal.SessionState.closing, sessions[0].state);
+    try std.testing.expectEqual(@as(u32, 2), sessions[0].outstanding);
+    const requests = [_]*internal.Request{ &sessions[0].send_request, &sessions[0].receive_request };
+    for (requests, 0..) |request, index| {
+        session_machine.processRioResult(&worker, .{
+            .Status = c.ERROR_SUCCESS,
+            .BytesTransferred = 0,
+            .SocketContext = null,
+            .RequestContext = @ptrCast(request),
+        });
+        try std.testing.expectEqual(if (index == 0) internal.SessionState.closing else .done, sessions[0].state);
+    }
+    try std.testing.expectEqual(@as(u32, 0), worker.live_sessions);
+}
+
+test "client failed active attempt accounts claimed echoes once" {
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const heap = try timer.Heap.init(&nodes, &positions);
+    var sockets: [1]win32.Socket = .{.{}};
+    var owner: internal.WorkerResources = .{ .session_sockets = &sockets };
+    var metrics: internal.Metrics = .{};
+    metrics.claimed.store(8, .monotonic);
+    const options: client.types.Options = .{};
+    var worker: internal.Worker = .{};
+    var sessions: [1]internal.Session = .{.{}};
+    worker.resources = &owner;
+    worker.sessions = &sessions;
+    worker.session_count = 1;
+    worker.live_sessions = 1;
+    worker.timers = heap;
+    worker.options = &options;
+    worker.metrics = &metrics;
+    sessions[0].owner = &worker;
+    sessions[0].state = .active;
+    sessions[0].outstanding = 1;
+    sessions[0].requested_echoes = 8;
+    sessions[0].send_request.session = &sessions[0];
+    session_machine.connectionFailed(&sessions[0]);
+    try std.testing.expectEqual(internal.SessionState.closing, sessions[0].state);
+    try std.testing.expectEqual(@as(u64, 8), metrics.lost.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), metrics.network_errors.load(.monotonic));
+    try std.testing.expect(sessions[0].attempt_accounted);
+    session_machine.processRioResult(&worker, .{
+        .Status = c.ERROR_SUCCESS,
+        .BytesTransferred = 0,
+        .SocketContext = null,
+        .RequestContext = @ptrCast(&sessions[0].send_request),
+    });
+    try std.testing.expectEqual(internal.SessionState.done, sessions[0].state);
+    try std.testing.expectEqual(@as(u64, 8), metrics.lost.load(.monotonic));
+    try std.testing.expect(internal.sessionTerminalAccountingValid(8, 0, 0, metrics.lost.load(.monotonic)));
+}
 
 comptime {
     if (@FieldType(internal.Worker, "resources") != ?*internal.WorkerResources)

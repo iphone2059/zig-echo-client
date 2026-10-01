@@ -109,7 +109,7 @@ try {
 $port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port 'fragment'
 try {
-    [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '8', '/c', '1', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('echoed=8', 'lost=0', 'bytes=32768'))
+    [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '8', '/c', '1', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('echoed=8', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=32768'))
 } finally { Stop-Peer $peer }
 
 $port = Get-FreePort 'tcp'
