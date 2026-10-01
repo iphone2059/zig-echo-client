@@ -7,7 +7,10 @@ pub const sdk = @import("sdk.zig");
 pub const win32 = @import("win32.zig");
 pub const rio = @import("rio.zig");
 pub const engine_internal = @import("engine_internal.zig");
+pub const client_session = @import("client_session.zig");
+pub const client_worker = @import("client_worker.zig");
 pub const engine = @import("engine.zig");
+pub const bench_histogram = @import("bench_histogram.zig");
 test {
     _ = contract;
     _ = pattern;
@@ -18,5 +21,8 @@ test {
     _ = win32;
     _ = rio;
     _ = engine_internal;
+    _ = client_session;
+    _ = client_worker;
     _ = engine;
+    _ = bench_histogram;
 }

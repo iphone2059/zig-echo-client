@@ -9,8 +9,10 @@ $expected = @{
     corrupt_cq = 'RIODequeueCompletion(client)'
     invalid_transition = 'client notification delivery transition'
     control_post_failure = 'PostQueuedCompletionStatus(client stop)'
+    outstanding_release = 'client worker release precondition'
+    outstanding_cq_retirement = 'client CQ retirement with outstanding operations'
 }
-foreach ($mode in @('notify_failure', 'corrupt_cq', 'invalid_transition', 'control_post_failure')) {
+foreach ($mode in @('notify_failure', 'corrupt_cq', 'invalid_transition', 'control_post_failure', 'outstanding_release', 'outstanding_cq_retirement')) {
     $id = [Guid]::NewGuid().ToString('N')
     $stdout = Join-Path ([IO.Path]::GetTempPath()) "zig-client-fault-$id-out.txt"
     $stderr = Join-Path ([IO.Path]::GetTempPath()) "zig-client-fault-$id-err.txt"

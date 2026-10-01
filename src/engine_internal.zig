@@ -3,6 +3,8 @@ const win32 = @import("win32.zig");
 const rio = @import("rio.zig");
 const types = @import("types.zig");
 const timer = @import("timer_heap.zig");
+const bench_config = @import("bench_config");
+const bench = @import("bench_histogram.zig");
 const c = win32.c;
 
 pub const WorkerPhase = enum(u8) { starting, running, draining, stopped };
@@ -24,6 +26,31 @@ pub const Metrics = struct {
     bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     network_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     latency_bins: [64]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+};
+
+pub const WorkerResources = struct {
+    port: win32.Handle = .{},
+    thread: win32.ThreadHandle = .{},
+    arena: win32.VirtualMemory = .{},
+    registration: rio.Registration = .{},
+    completion_queue: rio.CompletionQueue = .{},
+    sessions: []Session = &.{},
+    timer_nodes: []timer.Node = &.{},
+    timer_positions: []u32 = &.{},
+    session_sockets: []win32.Socket = &.{},
+
+    pub fn deinit(self: *WorkerResources, allocator: std.mem.Allocator) void {
+        for (self.session_sockets) |*socket| socket.deinit();
+        self.completion_queue.deinit();
+        self.registration.deinit();
+        self.arena.deinit();
+        if (self.session_sockets.len != 0) allocator.free(self.session_sockets);
+        if (self.sessions.len != 0) allocator.free(self.sessions);
+        if (self.timer_nodes.len != 0) allocator.free(self.timer_nodes);
+        if (self.timer_positions.len != 0) allocator.free(self.timer_positions);
+        self.port.deinit();
+        self.* = .{};
+    }
 };
 
 pub const Request = struct {
@@ -57,7 +84,7 @@ pub const Session = struct {
 };
 
 pub const Worker = struct {
-    resources: ?*anyopaque = null,
+    resources: ?*WorkerResources = null,
     rio_api: ?*const rio.Api = null,
     connect_ex: ?c.LPFN_CONNECTEX = null,
     options: ?*const types.Options = null,
@@ -65,6 +92,7 @@ pub const Worker = struct {
     pattern: []const u8 = &.{},
     maximum_attempt_bytes: usize = 0,
     metrics: ?*Metrics = null,
+    bench_histogram: if (bench_config.enabled) bench.Histogram else void = if (bench_config.enabled) bench.Histogram.init() else {},
     external_stop: ?*std.atomic.Value(bool) = null,
     fatal: ?*std.atomic.Value(bool) = null,
     port: c.HANDLE = null,
