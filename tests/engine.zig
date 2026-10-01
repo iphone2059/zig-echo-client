@@ -7,6 +7,26 @@ const internal = client.engine_internal;
 const timer = client.timer_heap;
 const engine = client.engine;
 
+comptime {
+    if (@FieldType(internal.Worker, "resources") != ?*internal.WorkerResources)
+        @compileError("client worker resources must have a concrete owner type");
+    if (engine.WorkerResources != internal.WorkerResources)
+        @compileError("client engine compatibility alias must retain the concrete owner type");
+}
+
+test "client unpublished partly initialized owner releases acquired resources" {
+    var owner: internal.WorkerResources = .{};
+    owner.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
+    try std.testing.expect(owner.port.get() != null);
+    owner.arena = try win32.VirtualMemory.alloc(4096);
+    var worker: internal.Worker = .{};
+    worker.resources = &owner;
+    engine.destroyWorker(&worker);
+    try std.testing.expect(owner.port.get() == null);
+    try std.testing.expect(owner.arena.ptr == null);
+    try std.testing.expect(worker.resources == null);
+}
+
 test "client worker partition covers every session without empty workers" {
     try std.testing.expectEqual(@as(u32, 2), engine.workerCount(2, 8));
     try std.testing.expectEqual(@as(u32, 3), engine.partitionSessions(10, 3, 0));
@@ -102,7 +122,7 @@ test "client closes idle CQ with an armed and already queued notification" {
     owner.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
     try std.testing.expect(owner.port.value != null);
     var worker: internal.Worker = .{};
-    worker.resources = @ptrCast(&owner);
+    worker.resources = &owner;
     worker.port = owner.port.value;
     var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
     notification.Type = c.RIO_IOCP_COMPLETION;

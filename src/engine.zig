@@ -16,20 +16,10 @@ const batch_size: u32 = 256;
 const stop_key: usize = 1;
 const allocator = std.heap.page_allocator;
 
-pub const WorkerResources = struct {
-    port: win32.Handle = .{},
-    thread: win32.ThreadHandle = .{},
-    arena: win32.VirtualMemory = .{},
-    registration: rio.Registration = .{},
-    completion_queue: rio.CompletionQueue = .{},
-    sessions: []Session = &.{},
-    timer_nodes: []timer.Node = &.{},
-    timer_positions: []u32 = &.{},
-    session_sockets: []win32.Socket = &.{},
-};
+pub const WorkerResources = internal.WorkerResources;
 
 fn resources(worker: *Worker) *WorkerResources {
-    return @ptrCast(@alignCast(worker.resources.?));
+    return worker.resources.?;
 }
 
 pub fn workerCount(sessions: u32, requested: u32) u32 {
@@ -424,7 +414,7 @@ fn workerThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
 pub fn initializeWorker(worker: *Worker, extensions: *const rio.Extensions, options: *const types.Options, remote: *const c.SOCKADDR_IN, pattern: []const u8, maximum_attempt_bytes: usize, metrics: *Metrics, external_stop: *std.atomic.Value(bool), fatal: *std.atomic.Value(bool), worker_index: u32, session_count: u32, memory_share: u64, owner: *WorkerResources) bool {
     worker.* = .{};
     owner.* = .{};
-    worker.resources = @ptrCast(owner);
+    worker.resources = owner;
     worker.rio_api = &extensions.rio;
     worker.connect_ex = extensions.connect_ex;
     worker.options = options;
@@ -525,15 +515,8 @@ pub fn destroyWorker(worker: *Worker) void {
         const lifecycle: internal.WorkerLifecycle = .{ .phase = .stopped, .live_sessions = worker.live_sessions, .total_outstanding = outstanding, .notification_armed = worker.notification_armed };
         if (!internal.workerMayRelease(&lifecycle) or worker.timers.?.len != 0) fail("client worker release precondition", c.ERROR_INVALID_STATE);
     }
-    for (owner.session_sockets) |*socket| socket.deinit();
-    owner.completion_queue.deinit();
-    owner.registration.deinit();
-    owner.arena.deinit();
-    if (owner.session_sockets.len != 0) allocator.free(owner.session_sockets);
-    if (owner.sessions.len != 0) allocator.free(owner.sessions);
-    if (owner.timer_nodes.len != 0) allocator.free(owner.timer_nodes);
-    if (owner.timer_positions.len != 0) allocator.free(owner.timer_positions);
-    owner.port.deinit();
+    owner.deinit(allocator);
+    worker.resources = null;
     worker.ready = false;
 }
 
