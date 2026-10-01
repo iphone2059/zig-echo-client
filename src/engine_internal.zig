@@ -3,6 +3,8 @@ const win32 = @import("win32.zig");
 const rio = @import("rio.zig");
 const types = @import("types.zig");
 const timer = @import("timer_heap.zig");
+const bench_config = @import("bench_config");
+const bench = @import("bench_histogram.zig");
 const c = win32.c;
 
 pub const WorkerPhase = enum(u8) { starting, running, draining, stopped };
@@ -65,6 +67,7 @@ pub const Worker = struct {
     pattern: []const u8 = &.{},
     maximum_attempt_bytes: usize = 0,
     metrics: ?*Metrics = null,
+    bench_histogram: if (bench_config.enabled) bench.Histogram else void = if (bench_config.enabled) bench.Histogram.init() else {},
     external_stop: ?*std.atomic.Value(bool) = null,
     fatal: ?*std.atomic.Value(bool) = null,
     port: c.HANDLE = null,

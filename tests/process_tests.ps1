@@ -1,5 +1,6 @@
 param(
-    [string]$ClientPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'zig-out\bin\zig-echo-client.exe')
+    [string]$ClientPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'zig-out\bin\zig-echo-client.exe'),
+    [switch]$BenchHistogram
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,7 +80,10 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
 $port = Get-FreePort 'udp'
 $peer = Start-Peer 'udp' $port
 try {
-    [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '13', '/c', '8', '/threads', '2', '/zt', '128', '/t', '2', '/stats') 0 @('final ', 'sessions=8', 'echoed=13', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=1664', 'latency_sample=batch'))
+    $sampleOutput = Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '13', '/c', '8', '/threads', '2', '/zt', '128', '/t', '2', '/stats') 0 @('final ', 'sessions=8', 'echoed=13', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=1664', 'latency_sample=batch')
+    if ($BenchHistogram) {
+        if ($sampleOutput -notmatch '(?m)^bench_latency_sample=batch bench_samples=13 ') { throw "benchmark histogram count must equal 13 completed UDP batches: $sampleOutput" }
+    } elseif ($sampleOutput.Contains('bench_latency_sample=')) { throw "default build emitted benchmark-only latency fields: $sampleOutput" }
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '5', '/c', '4', '/threads', '2', '/z', '65507', '/t', '2', '/stats') 0 @('echoed=5', 'lost=0', 'bytes=327535'))
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '4', '/c', '2', '/threads', '2', '/i', '50', '/zt', '128', '/t', '2', '/stats') 0 @('echoed=4', 'lost=0', 'bytes=512'))
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '0', '/c', '1', '/i', '50', '/w', '2', '/report', '1', '/t', '2', '/stats') 0 @('report ', 'final ', 'corrupted=0', 'lost=0'))
@@ -88,7 +92,10 @@ try {
 $port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port
 try {
-    [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '17', '/c', '8', '/threads', '2', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('sessions=8', 'echoed=17', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=69632', 'latency_sample=batch'))
+    $sampleOutput = Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '17', '/c', '8', '/threads', '2', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('sessions=8', 'echoed=17', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=69632', 'latency_sample=batch')
+    if ($BenchHistogram) {
+        if ($sampleOutput -notmatch '(?m)^bench_latency_sample=batch bench_samples=3 ') { throw "benchmark histogram count must equal 3 completed TCP batches, not 17 echoes: $sampleOutput" }
+    } elseif ($sampleOutput.Contains('bench_latency_sample=')) { throw "default build emitted benchmark-only latency fields: $sampleOutput" }
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '1', '/c', '8', '/threads', '2', '/k', '8', '/zt', '128', '/t', '2', '/stats') 0 @('echoed=1', 'lost=0', 'bytes=128'))
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '0', '/c', '2', '/threads', '2', '/k', '1', '/i', '50', '/zt', '128', '/t', '2', '/w', '1', '/stats') 0 @('final ', 'sessions=2', 'corrupted=0', 'lost=0', 'latency_sample=batch'))
 } finally { Stop-Peer $peer }

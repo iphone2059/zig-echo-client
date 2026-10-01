@@ -15,6 +15,9 @@ fn addMsvcSdkEnvironment(b: *std.Build, module: *std.Build.Module) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const bench_histogram = b.option(bool, "bench-histogram", "Enable worker-owned benchmark latency histograms") orelse false;
+    const bench_options = b.addOptions();
+    bench_options.addOption(bool, "enabled", bench_histogram);
     if (target.result.os.tag != .windows or target.result.abi != .msvc)
         @panic("zig-echo-client requires a Windows MSVC ABI target");
 
@@ -25,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addMsvcSdkEnvironment(b, root_module);
+    root_module.addOptions("bench_config", bench_options);
     root_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     root_module.linkSystemLibrary("kernel32", .{ .use_pkg_config = .no });
 
@@ -38,12 +42,24 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addMsvcSdkEnvironment(b, test_module);
+    test_module.addOptions("bench_config", bench_options);
     test_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     test_module.linkSystemLibrary("kernel32", .{ .use_pkg_config = .no });
     const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all self-contained client tests");
     test_step.dependOn(&run_tests.step);
+
+    const histogram_module = b.createModule(.{
+        .root_source_file = b.path("tests/bench_histogram.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    histogram_module.addImport("client", test_module);
+    const histogram_tests = b.addTest(.{ .root_module = histogram_module });
+    const run_histogram_tests = b.addRunArtifact(histogram_tests);
+    test_step.dependOn(&run_histogram_tests.step);
 
     const acceptance_step = b.step("acceptance", "Run the self-contained client acceptance suite");
     acceptance_step.dependOn(test_step);
@@ -116,7 +132,10 @@ pub fn build(b: *std.Build) void {
 
     const source_policy = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/source_policy.ps1" });
     const fault_process = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/fault_process_tests.ps1" });
-    const process_tests = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1" });
+    const process_tests = if (bench_histogram)
+        b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1", "-BenchHistogram" })
+    else
+        b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1" });
     const abi_contract = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/sdk_abi_contract.ps1" });
     fault_process.step.dependOn(b.getInstallStep());
     process_tests.step.dependOn(b.getInstallStep());

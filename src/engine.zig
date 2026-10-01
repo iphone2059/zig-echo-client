@@ -7,6 +7,7 @@ const pattern_mod = @import("pattern.zig");
 const types = @import("types.zig");
 const internal = @import("engine_internal.zig");
 const timer = @import("timer_heap.zig");
+const bench_config = @import("bench_config");
 
 pub const Worker = internal.Worker;
 pub const Session = internal.Session;
@@ -237,6 +238,7 @@ fn recordLatency(worker: *Worker, started: c.LARGE_INTEGER) void {
     const microseconds: u64 = @intCast(@max(@as(u128, 1), @as(u128, ticks) * 1_000_000 / @as(u64, @intCast(worker.performance_frequency.QuadPart))));
     const bin: usize = @min(@as(usize, 63), @as(usize, std.math.log2_int(u64, microseconds)));
     _ = worker.metrics.?.latency_bins[bin].fetchAdd(1, .monotonic);
+    if (bench_config.enabled) worker.bench_histogram.record(microseconds);
 }
 
 fn completeAttempt(session: *Session) void {
@@ -584,6 +586,24 @@ pub fn printMetrics(phase: []const u8, options: *const types.Options, metrics: *
     if (!win32.writeStdout(line)) fail("client metrics output", c.GetLastError());
 }
 
+fn printBenchLatency(workers: []const Worker) void {
+    if (!bench_config.enabled) return;
+    var combined = @import("bench_histogram.zig").Histogram.init();
+    for (workers) |worker| {
+        for (worker.bench_histogram.buckets, 0..) |samples, index| combined.buckets[index] += samples;
+        combined.count += worker.bench_histogram.count;
+    }
+    var buffer: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "bench_latency_sample=batch bench_samples={d} p50_us~{d} p99_us~{d} p999_us~{d} max_us~{d}\n", .{
+        combined.count,
+        combined.percentile(50, 100),
+        combined.percentile(99, 100),
+        combined.percentile(999, 1000),
+        combined.percentile(1, 1),
+    }) catch fail("client benchmark latency format", c.ERROR_INSUFFICIENT_BUFFER);
+    if (!win32.writeStdout(line)) fail("client benchmark latency output", c.GetLastError());
+}
+
 pub fn runClient(options: *const types.Options, stop: *std.atomic.Value(bool)) types.ExitCode {
     var winsock = win32.Winsock.init() catch return .network;
     defer winsock.deinit();
@@ -665,5 +685,6 @@ pub fn runClient(options: *const types.Options, stop: *std.atomic.Value(bool)) t
     const corrupted = metrics.corrupted.load(.monotonic);
     const lost = metrics.lost.load(.monotonic);
     if (!options.quiet or options.stats) printMetrics("final", options, &metrics, c.GetTickCount64() - start);
+    if (bench_config.enabled) printBenchLatency(workers[0..initialized]);
     return @fromBackingInt(@intCast(contract.classifyResult(echoed, corrupted, lost, metrics.network_errors.load(.monotonic), fatal.load(.acquire), stop.load(.acquire))));
 }
