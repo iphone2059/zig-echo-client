@@ -63,10 +63,15 @@ function Test-BenchmarkRun {
 }
 
 function Get-ExecutableCommit {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnknown)
 
     $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
-    $commit = & git -C $directory rev-parse HEAD 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return ([string]$commit).Trim()
+    $marker = Join-Path $directory 'source-commit.txt'
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        if ($AllowUnknown) { return $null }
+        throw "executable source commit marker missing: $marker"
+    }
+    $commit = (Get-Content -LiteralPath $marker -Raw).Trim()
+    if ($commit -cnotmatch '^[0-9a-f]{40}$') { throw "invalid executable source commit marker: $marker" }
+    return $commit
 }

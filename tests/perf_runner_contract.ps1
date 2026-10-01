@@ -77,8 +77,25 @@ $describedHost = & $runner -ClientPath 'missing-client.exe' -PeerPath 'missing-s
     -PeerArguments @('/p','tcp','/s','7000') -ExpectedPeerSha256 ('a' * 64) -Port 7000 `
     -Case 'tcp_128_k1' -OutputDirectory $nonexistentOutput -Label 'dry-run' -DescribeOnly -HostAddress '127.0.0.2'
 Assert-True ($describedHost.arguments[0] -ceq '127.0.0.2') 'runner ignored explicit peer IPv4 address'
-$clientExe = Join-Path (Split-Path -Parent $PSScriptRoot) 'zig-out\bin\zig-echo-client.exe'
-$expectedCommit = (& git -C (Split-Path -Parent $PSScriptRoot) rev-parse HEAD | Out-String).Trim()
-Assert-True ((Get-ExecutableCommit -Path $clientExe) -ceq $expectedCommit) 'executable Git provenance is wrong'
+$fixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ('zig-client-provenance-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $fixtureDirectory
+$fixtureExe = Join-Path $fixtureDirectory 'frozen-client.exe'
+$marker = Join-Path $fixtureDirectory 'source-commit.txt'
+try {
+    $missingRejected = $false
+    try { $null = Get-ExecutableCommit -Path $fixtureExe } catch { $missingRejected = $true }
+    Assert-True $missingRejected 'missing executable source marker was accepted'
+    Assert-True ($null -eq (Get-ExecutableCommit -Path $fixtureExe -AllowUnknown)) 'unknown peer commit was invented'
+    $expectedCommit = '557cc03dab581347147b1b682076d4992c3137d0'
+    Set-Content -LiteralPath $marker -Value $expectedCommit -Encoding ascii
+    Assert-True ((Get-ExecutableCommit -Path $fixtureExe) -ceq $expectedCommit) 'frozen executable marker was ignored'
+    Set-Content -LiteralPath $marker -Value 'invalid' -Encoding ascii
+    $invalidRejected = $false
+    try { $null = Get-ExecutableCommit -Path $fixtureExe } catch { $invalidRejected = $true }
+    Assert-True $invalidRejected 'malformed executable source marker was accepted'
+} finally {
+    if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker }
+    Remove-Item -LiteralPath $fixtureDirectory
+}
 
 Write-Output 'client performance runner contract passed'
