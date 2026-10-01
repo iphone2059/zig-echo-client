@@ -7,7 +7,12 @@ $ErrorActionPreference = 'Stop'
 $server = (Resolve-Path -LiteralPath $ServerPath).Path
 $client = (Resolve-Path -LiteralPath $ClientPath).Path
 
-function Get-FreePort {
+function Get-FreePort([string]$protocol) {
+    if ($protocol -eq 'udp') {
+        $socket = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0))
+        try { return ([System.Net.IPEndPoint]$socket.Client.LocalEndPoint).Port }
+        finally { $socket.Dispose() }
+    }
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try { return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port }
@@ -40,7 +45,7 @@ function Invoke-ClientCase([string[]]$arguments, [string[]]$expected) {
 }
 
 foreach ($protocol in @('tcp', 'udp')) {
-    $port = Get-FreePort
+    $port = Get-FreePort $protocol
     $id = [Guid]::NewGuid().ToString('N')
     $outPath = Join-Path ([IO.Path]::GetTempPath()) "zig-interop-server-$id-out.txt"
     $errPath = Join-Path ([IO.Path]::GetTempPath()) "zig-interop-server-$id-err.txt"

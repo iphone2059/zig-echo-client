@@ -19,7 +19,7 @@ From this project root:
 .\build.ps1 ReleaseFast
 ```
 
-`build.ps1` pins the compiler version, enters the x64 MSVC/SDK environment, builds, and runs the complete self-contained suite. `-BuildOnly` omits tests. The executable is `zig-out\bin\zig-echo-client.exe`.
+`build.ps1` pins the compiler version, enters the x64 MSVC/SDK environment, builds, and runs the complete self-contained suite. Compiler selection is `-ZigPath`, then `ZIG_EXE`, then the pinned installation directory, then `PATH`; a version mismatch is rejected. `-BuildOnly` omits tests. The executable is `zig-out\bin\zig-echo-client.exe`.
 
 ## TCP example
 

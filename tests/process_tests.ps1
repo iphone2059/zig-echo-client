@@ -5,7 +5,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $client = (Resolve-Path -LiteralPath $ClientPath).Path
 
-function Get-FreePort {
+function Get-FreePort([string]$protocol) {
+    if ($protocol -eq 'udp') {
+        $socket = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0))
+        try { return ([System.Net.IPEndPoint]$socket.Client.LocalEndPoint).Port }
+        finally { $socket.Dispose() }
+    }
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try { return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port }
@@ -71,7 +76,7 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
 [void](Invoke-Client @('/h') 0 @('Usage: zig-echo-client target /p tcp|udp', 'Data I/O is always RIO'))
 [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/d', '') 1 @('Usage: zig-echo-client target /p tcp|udp') @('Invalid arguments:'))
 
-$port = Get-FreePort
+$port = Get-FreePort 'udp'
 $peer = Start-Peer 'udp' $port
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '13', '/c', '8', '/threads', '2', '/zt', '128', '/t', '2', '/stats') 0 @('final ', 'sessions=8', 'echoed=13', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=1664', 'latency_sample=batch'))
@@ -80,7 +85,7 @@ try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '0', '/c', '1', '/i', '50', '/w', '2', '/report', '1', '/t', '2', '/stats') 0 @('report ', 'final ', 'corrupted=0', 'lost=0'))
 } finally { Stop-Peer $peer }
 
-$port = Get-FreePort
+$port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '17', '/c', '8', '/threads', '2', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('sessions=8', 'echoed=17', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=69632', 'latency_sample=batch'))
@@ -88,25 +93,25 @@ try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '0', '/c', '2', '/threads', '2', '/k', '1', '/i', '50', '/zt', '128', '/t', '2', '/w', '1', '/stats') 0 @('final ', 'sessions=2', 'corrupted=0', 'lost=0', 'latency_sample=batch'))
 } finally { Stop-Peer $peer }
 
-$port = Get-FreePort
+$port = Get-FreePort 'udp'
 $peer = Start-Peer 'udp' $port 'blackhole'
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '1', '/c', '1', '/t', '1', '/stats') 3 @('echoed=0', 'lost=1', 'network_errors=1'))
 } finally { Stop-Peer $peer }
 
-$port = Get-FreePort
+$port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port 'fragment'
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '8', '/c', '1', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('echoed=8', 'lost=0', 'bytes=32768'))
 } finally { Stop-Peer $peer }
 
-$port = Get-FreePort
+$port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port 'close'
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '8', '/c', '1', '/k', '8', '/z', '4096', '/t', '1', '/stats') 3 @('echoed=0', 'lost=8', 'network_errors=1'))
 } finally { Stop-Peer $peer }
 
-$port = Get-FreePort
+$port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port 'blackhole'
 try {
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '0', '/c', '1', '/k', '8', '/z', '4096', '/t', '3', '/w', '1', '/stats') 0 @('final ', 'corrupted=0', 'lost=0', 'latency_sample=batch'))
@@ -114,7 +119,7 @@ try {
 
 $forcedStopDriver = Join-Path (Split-Path -Parent $client) 'zig-echo-client-external-stop-driver.exe'
 if (-not (Test-Path -LiteralPath $forcedStopDriver -PathType Leaf)) { throw "Missing forced-stop driver: $forcedStopDriver" }
-$port = Get-FreePort
+$port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port 'blackhole'
 try {
     $previousClient = $client
@@ -126,7 +131,7 @@ try {
     Stop-Peer $peer
 }
 
-$port = Get-FreePort
+$port = Get-FreePort 'tcp'
 $id = [Guid]::NewGuid().ToString('N')
 $stdout = Join-Path ([IO.Path]::GetTempPath()) "zig-client-reconnect-$id-out.txt"
 $stderr = Join-Path ([IO.Path]::GetTempPath()) "zig-client-reconnect-$id-err.txt"
