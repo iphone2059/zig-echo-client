@@ -26,6 +26,12 @@ pub fn main(init: std.process.Init) u8 {
         if (worker.thread == null) return 2;
         owner.thread.reset(worker.thread);
         engine.destroyWorker(&worker);
+    } else if (std.mem.eql(u8, mode, "outstanding_cq_retirement")) {
+        var sessions: [1]client.engine_internal.Session = .{.{ .outstanding = 1 }};
+        var worker: client.engine_internal.Worker = .{};
+        worker.sessions = &sessions;
+        worker.session_count = 1;
+        engine.retireCompletionQueue(&worker);
     } else return 2;
     return 0;
 }

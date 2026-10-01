@@ -76,6 +76,7 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
 
 [void](Invoke-Client @('/h') 0 @('Usage: zig-echo-client target /p tcp|udp', 'Data I/O is always RIO'))
 [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/d', '') 1 @('Usage: zig-echo-client target /p tcp|udp') @('Invalid arguments:'))
+[void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', '7', '/n', '17', '/c', '64', '/threads', '1', '/cq', '64', '/stats') 4 @('final ', 'echoed=0', 'lost=17', 'network_errors=0') @('client worker IOCP/CQ/arena capacity'))
 
 $port = Get-FreePort 'udp'
 $peer = Start-Peer 'udp' $port

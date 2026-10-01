@@ -7,6 +7,112 @@ const internal = client.engine_internal;
 const timer = client.timer_heap;
 const engine = client.engine;
 const session_machine = client.client_session;
+const worker_machine = client.client_worker;
+
+var notification_trace: [2]u8 = @splat(0);
+var notification_trace_len: usize = 0;
+fn fakeDequeue(_: c.RIO_CQ, _: [*c]c.RIORESULT, _: c.ULONG) callconv(.winapi) c.ULONG {
+    notification_trace[notification_trace_len] = 'D';
+    notification_trace_len += 1;
+    return 0;
+}
+fn fakeNotify(_: c.RIO_CQ) callconv(.winapi) c_int {
+    notification_trace[notification_trace_len] = 'N';
+    notification_trace_len += 1;
+    return c.ERROR_SUCCESS;
+}
+
+test "client RIO notification drains its CQ before one rearm" {
+    var api: rio.Api = .{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) };
+    api.table.RIODequeueCompletion = fakeDequeue;
+    api.table.RIONotify = fakeNotify;
+    var worker: internal.Worker = .{};
+    worker.rio_api = &api;
+    worker.notification_armed = true;
+    notification_trace_len = 0;
+    worker_machine.completeNotification(&worker);
+    try std.testing.expectEqualStrings("DN", notification_trace[0..notification_trace_len]);
+    try std.testing.expect(worker.notification_armed);
+}
+
+fn claimBatches(metrics: *internal.Metrics, counts: *[9]u32) void {
+    while (true) {
+        const granted = client.contract.claimAttempts(&metrics.claimed, 17, 8);
+        if (granted == 0) return;
+        counts[@intCast(granted)] += 1;
+    }
+}
+
+test "two client workers claim exactly 17 echoes in 8 8 1 batches" {
+    var metrics: internal.Metrics = .{};
+    var first_counts: [9]u32 = @splat(0);
+    var second_counts: [9]u32 = @splat(0);
+    const first = try std.Thread.spawn(.{}, claimBatches, .{ &metrics, &first_counts });
+    const second = std.Thread.spawn(.{}, claimBatches, .{ &metrics, &second_counts }) catch |err| {
+        first.join();
+        return err;
+    };
+    first.join();
+    second.join();
+    try std.testing.expectEqual(@as(u64, 17), metrics.claimed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), first_counts[8] + second_counts[8]);
+    try std.testing.expectEqual(@as(u32, 1), first_counts[1] + second_counts[1]);
+    for (2..8) |size| try std.testing.expectEqual(@as(u32, 0), first_counts[size] + second_counts[size]);
+}
+
+test "client worker staged capacity failure rolls back unpublished ownership" {
+    const options: client.types.Options = .{ .cq_capacity = 0 };
+    const extensions: rio.Extensions = .{ .rio = .{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) }, .connect_ex = null };
+    const remote: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
+    const pattern = [_]u8{0x41};
+    var metrics: internal.Metrics = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    var fatal = std.atomic.Value(bool).init(false);
+    var owner: internal.WorkerResources = .{};
+    var worker: internal.Worker = .{};
+    try std.testing.expectError(error.Capacity, worker_machine.initializeWorker(&worker, &extensions, &options, &remote, &pattern, 1, &metrics, &stop, &fatal, 0, 1, 1024, &owner));
+    try std.testing.expect(worker.resources == null);
+    try std.testing.expect(owner.port.get() == null);
+    try std.testing.expect(owner.arena.ptr == null);
+    try std.testing.expect(!worker.ready);
+}
+
+test "client worker rolls back every acquired resource stage before publication" {
+    var winsock = try win32.Winsock.init();
+    defer winsock.deinit();
+    const extensions = try rio.Extensions.load();
+    const options: client.types.Options = .{ .cq_capacity = 4096 };
+    const remote: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
+    const pattern = [_]u8{0x41};
+    const cases = [_]struct { stage: worker_machine.TestInitStage, expected: anyerror }{
+        .{ .stage = .port, .expected = error.Port },
+        .{ .stage = .arena, .expected = error.Arena },
+        .{ .stage = .sessions, .expected = error.Sessions },
+        .{ .stage = .timer_nodes, .expected = error.TimerNodes },
+        .{ .stage = .timer_positions, .expected = error.TimerPositions },
+        .{ .stage = .socket_owners, .expected = error.SocketOwners },
+        .{ .stage = .timer_heap, .expected = error.TimerHeap },
+        .{ .stage = .registration, .expected = error.Registration },
+        .{ .stage = .completion_queue, .expected = error.CompletionQueue },
+    };
+    defer worker_machine.test_fail_stage = null;
+    for (cases) |case| {
+        var metrics: internal.Metrics = .{};
+        var stop = std.atomic.Value(bool).init(false);
+        var fatal = std.atomic.Value(bool).init(false);
+        var owner: internal.WorkerResources = .{};
+        var worker: internal.Worker = .{};
+        worker_machine.test_fail_stage = case.stage;
+        try std.testing.expectError(case.expected, worker_machine.initializeWorker(&worker, &extensions, &options, &remote, &pattern, 1, &metrics, &stop, &fatal, 0, 1, 1024 * 1024, &owner));
+        try std.testing.expect(worker.resources == null);
+        try std.testing.expect(owner.port.get() == null);
+        try std.testing.expect(owner.arena.ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), owner.sessions.len);
+        try std.testing.expectEqual(@as(usize, 0), owner.timer_nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), owner.session_sockets.len);
+        try std.testing.expect(!worker.ready);
+    }
+}
 
 var last_reposted_offset: u32 = 0;
 var last_reposted_length: u32 = 0;
