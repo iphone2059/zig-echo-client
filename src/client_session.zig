@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32.zig");
 const c = win32.c;
 const internal = @import("engine_internal.zig");
-const contract = @import("contract.zig");
+const contract = @import("cec_contract.zig");
 const bench_config = @import("bench_config");
 const Session = internal.Session;
 const Worker = internal.Worker;
@@ -297,3 +297,4 @@ pub fn stopWorker(worker: *Worker) void {
         }
     }
 }
+

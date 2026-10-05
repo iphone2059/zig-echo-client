@@ -1,5 +1,5 @@
 const std = @import("std");
-const contract = @import("contract.zig");
+const contract = @import("cec_contract.zig");
 
 /// Benchmark-only, worker-owned latency samples. Each record is one completed
 /// I/O batch, regardless of how many logical echoes were in that batch.
@@ -40,3 +40,4 @@ pub const Histogram = struct {
         unreachable;
     }
 };
+

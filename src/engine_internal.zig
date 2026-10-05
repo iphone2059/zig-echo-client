@@ -148,7 +148,7 @@ pub fn requestContextValid(request: *const Request, sessions: []const Session, o
 }
 
 pub fn percentile(metrics: *const Metrics, total: u64, numerator: u64, denominator: u64) u64 {
-    const target = @import("contract.zig").percentileTarget(total, numerator, denominator);
+    const target = @import("cec_contract.zig").percentileTarget(total, numerator, denominator);
     if (target == 0) return 0;
     var cumulative: u64 = 0;
     for (metrics.latency_bins, 0..) |bin, index| {
@@ -157,3 +157,4 @@ pub fn percentile(metrics: *const Metrics, total: u64, numerator: u64, denominat
     }
     return @as(u64, 1) << 63;
 }
+

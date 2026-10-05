@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32.zig");
 const c = win32.c;
 const rio = @import("rio.zig");
-const contract = @import("contract.zig");
+const contract = @import("cec_contract.zig");
 const pattern_mod = @import("pattern.zig");
 const types = @import("types.zig");
 const internal = @import("engine_internal.zig");
@@ -209,3 +209,4 @@ pub fn runClient(options: *const types.Options, stop: *std.atomic.Value(bool)) t
     if (bench_config.enabled) printBenchLatency(workers[0..initialized]);
     return @fromBackingInt(@intCast(contract.classifyResult(echoed, corrupted, lost, metrics.network_errors.load(.monotonic), fatal.load(.acquire), stop.load(.acquire))));
 }
+

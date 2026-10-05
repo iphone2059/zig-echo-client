@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("sdk.zig").c;
 const types = @import("types.zig");
-const options_mod = @import("options.zig");
+const options_mod = @import("cec_contract.zig");
 const win32 = @import("win32.zig");
 const engine = @import("engine.zig");
 
@@ -46,3 +46,4 @@ pub fn main(init: std.process.Init) u8 {
     defer _ = c.SetConsoleCtrlHandler(consoleHandler, c.FALSE);
     return @backingInt(engine.runClient(&options, &stop_requested));
 }
+
