@@ -75,7 +75,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             eq(name, "d") or eq(name, "z") or eq(name, "zt") or eq(name, "k") or eq(name, "c") or eq(name, "threads") or
             eq(name, "w") or eq(name, "rc") or eq(name, "report") or eq(name, "b") or eq(name, "cq") or eq(name, "memory");
         if (!known) {
-            setError(error_buffer, "unknown switch");
+            setError(error_buffer, @import("cec_contract.zig").token.unknown_switch);
             return false;
         }
         const value = inline_value orelse value: {
@@ -107,10 +107,10 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             continue;
         }
         const parsed = number(value) orelse {
-            setError(error_buffer, "numeric switch has an invalid value");
+            setError(error_buffer, @import("cec_contract.zig").token.invalid_number);
             return false;
         };
-        if (eq(name, "r") and parsed >= 1 and parsed <= 65535) out.remote_port = @intCast(parsed) else if (eq(name, "l") and parsed <= 65535) out.local_port = @intCast(parsed) else if (eq(name, "n")) out.echo_count = parsed else if (eq(name, "t") and parsed >= 1 and parsed <= std.math.maxInt(u32)) out.timeout_seconds = @intCast(parsed) else if (eq(name, "i") and parsed <= std.math.maxInt(u32)) out.interval_milliseconds = @intCast(parsed) else if (eq(name, "b") and parsed <= std.math.maxInt(i32)) out.socket_buffer_bytes = @intCast(parsed) else if (eq(name, "k") and parsed >= 1 and parsed <= std.math.maxInt(u32)) {
+        if (eq(name, "r") and parsed >= 1 and parsed <= 65535) out.remote_port = @intCast(parsed) else if (eq(name, "l") and parsed <= 65535) out.local_port = @intCast(parsed) else if (eq(name, "n")) out.echo_count = parsed else if (eq(name, "t") and parsed >= 1 and parsed <= std.math.maxInt(u32)) out.timeout_seconds = @intCast(parsed) else if (eq(name, "i") and parsed <= std.math.maxInt(u32)) out.interval_milliseconds = @intCast(parsed) else if (eq(name, "b") and parsed <= std.math.maxInt(i32)) out.socket_buffer_bytes = @intCast(parsed) else if (eq(name, "k") and parsed >= 1 and parsed <= 65536) {
             out.pipeline_depth = @intCast(parsed);
             saw_pipeline = true;
         } else if (eq(name, "z") and parsed >= 1 and parsed <= types.maximum_tcp_batch_bytes) {
@@ -122,12 +122,16 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             out.pattern_bytes = @intCast(parsed);
             saw_printable = true;
         } else if (eq(name, "w") and parsed >= 1 and parsed <= std.math.maxInt(u32)) out.run_seconds = @intCast(parsed) else if (eq(name, "rc") and parsed <= std.math.maxInt(i32)) out.reconnect_seconds = @intCast(parsed) else if (eq(name, "report") and parsed >= 1 and parsed <= std.math.maxInt(u32)) out.report_seconds = @intCast(parsed) else if (eq(name, "c") and parsed >= 1 and parsed <= 1048576) out.session_count = @intCast(parsed) else if (eq(name, "threads") and parsed >= 1 and parsed <= 64) out.worker_count = @intCast(parsed) else if (eq(name, "cq") and parsed >= 64 and parsed <= 1048576) out.cq_capacity = @intCast(parsed) else if (eq(name, "memory") and parsed >= 1048576) out.memory_bytes = parsed else {
-            setError(error_buffer, "unknown switch or value outside its valid range");
+            setError(error_buffer, @import("cec_contract.zig").token.out_of_range);
             return false;
         }
     }
     if (out.local_port != 0 and out.session_count != 1) {
         setError(error_buffer, "a fixed /l port requires /c 1");
+        return false;
+    }
+    if (out.protocol == .udp and saw_pipeline) {
+        setError(error_buffer, @import("cec_contract.zig").token.protocol_option);
         return false;
     }
     if (out.help) return true;
@@ -138,10 +142,6 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
     const patterns: u8 = @intFromBool(saw_literal) + @intFromBool(saw_binary) + @intFromBool(saw_printable);
     if (patterns > 1) {
         setError(error_buffer, "use exactly one of /d, /z, or /zt");
-        return false;
-    }
-    if (out.protocol == .udp and saw_pipeline) {
-        setError(error_buffer, "/k is available only for TCP");
         return false;
     }
     if (out.protocol == .tcp and out.reconnect_seconds >= 0 and out.local_port != 0) {

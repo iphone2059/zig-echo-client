@@ -16,13 +16,12 @@ fn consoleHandler(kind: c.DWORD) callconv(.winapi) c.BOOL {
 }
 
 fn help() void {
-    _ = win32.writeStdout(
-        "Usage: zig-echo-client target /p tcp|udp [/r port] [/l port] [/n count]\n" ++
-            "       [/t seconds] [/i ms] [/d text | /z bytes | /zt bytes] [/k tcp-depth]\n" ++
-            "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]\n" ++
-            "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
-            "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n",
-    );
+    _ = win32.writeStdout(@import("cec_contract.zig").usage);
+}
+
+/// A malformed command line reports the diagnostic and the usage on stderr, leaving stdout empty.
+fn helpError() void {
+    std.debug.print("{s}", .{@import("cec_contract.zig").usage});
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -32,7 +31,7 @@ pub fn main(init: std.process.Init) u8 {
     var options: types.Options = undefined;
     if (!options_mod.parseProcessArgs(init.minimal.args, arena_state.allocator(), &options, &error_buffer)) {
         std.debug.print("Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)});
-        help();
+        helpError();
         return @backingInt(types.ExitCode.usage);
     }
     if (options.help) {
