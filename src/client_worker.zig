@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32.zig");
 const c = win32.c;
 const rio = @import("rio.zig");
-const contract = @import("contract.zig");
+const contract = @import("cec_contract.zig");
 const pattern_mod = @import("pattern.zig");
 const types = @import("types.zig");
 const internal = @import("engine_internal.zig");
@@ -279,3 +279,4 @@ pub fn destroyWorker(worker: *Worker) void {
     worker.resources = null;
     worker.ready = false;
 }
+
