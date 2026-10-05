@@ -253,6 +253,14 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             setError(error_buffer, tokens.invalid_number);
             return false;
         };
+        const info = switchInfo(name) orelse {
+            setError(error_buffer, tokens.unknown_switch);
+            return false;
+        };
+        if (parsed < info.minimum or parsed > info.maximum) {
+            setError(error_buffer, tokens.out_of_range);
+            return false;
+        }
         if (eq(name, "r") and parsed >= 1 and parsed <= 65535) out.remote_port = @intCast(parsed) else if (eq(name, "l") and parsed <= 65535) out.local_port = @intCast(parsed) else if (eq(name, "n")) out.echo_count = parsed else if (eq(name, "t") and parsed >= 1 and parsed <= std.math.maxInt(u32)) out.timeout_seconds = @intCast(parsed) else if (eq(name, "i") and parsed <= std.math.maxInt(u32)) out.interval_milliseconds = @intCast(parsed) else if (eq(name, "b") and parsed <= std.math.maxInt(i32)) out.socket_buffer_bytes = @intCast(parsed) else if (eq(name, "k") and parsed >= 1 and parsed <= 65536) {
             out.pipeline_depth = @intCast(parsed);
             saw_pipeline = true;
