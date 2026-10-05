@@ -7,6 +7,44 @@
 /// Identifier of the frozen binary contract this file implements.
 pub const version = "echo-binary-contract-v1";
 
+/// The value switches this client accepts, as compile-time data. The parser asks the table instead
+/// of spelling every switch name out at each use, so the accepted set lives in exactly one place.
+pub const Switch = struct {
+    name: []const u8,
+    minimum: u64,
+    maximum: u64,
+};
+
+pub const switch_table = [_]Switch{
+    .{ .name = "p", .minimum = 0, .maximum = 0 },
+    .{ .name = "r", .minimum = 1, .maximum = 65535 },
+    .{ .name = "l", .minimum = 0, .maximum = 65535 },
+    .{ .name = "n", .minimum = 0, .maximum = std.math.maxInt(u64) },
+    .{ .name = "t", .minimum = 1, .maximum = std.math.maxInt(u32) },
+    .{ .name = "i", .minimum = 0, .maximum = std.math.maxInt(u32) },
+    .{ .name = "d", .minimum = 0, .maximum = 0 },
+    .{ .name = "z", .minimum = 1, .maximum = types.maximum_tcp_batch_bytes },
+    .{ .name = "zt", .minimum = 1, .maximum = types.maximum_tcp_batch_bytes },
+    .{ .name = "k", .minimum = 1, .maximum = 65536 },
+    .{ .name = "c", .minimum = 1, .maximum = 1048576 },
+    .{ .name = "threads", .minimum = 1, .maximum = 64 },
+    .{ .name = "w", .minimum = 1, .maximum = std.math.maxInt(u32) },
+    .{ .name = "rc", .minimum = 0, .maximum = std.math.maxInt(i32) },
+    .{ .name = "report", .minimum = 1, .maximum = std.math.maxInt(u32) },
+    .{ .name = "b", .minimum = 0, .maximum = std.math.maxInt(i32) },
+    .{ .name = "cq", .minimum = 64, .maximum = 1048576 },
+    .{ .name = "memory", .minimum = 1048576, .maximum = std.math.maxInt(u64) },
+};
+
+/// Compile-time lookup: the table is unrolled by the compiler, so a typo here is a build error.
+pub fn switchInfo(name: []const u8) ?Switch {
+    inline for (switch_table) |entry| {
+        if (std.ascii.eqlIgnoreCase(name, entry.name)) return entry;
+    }
+    return null;
+}
+
+
 /// Diagnostic tokens that must follow "Invalid arguments: " on stderr.
 pub const tokens = struct {
     pub const protocol_option = "protocol-option";
@@ -179,10 +217,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             out.reconnect_seconds = 1;
             continue;
         }
-        const known = eq(name, "p") or eq(name, "r") or eq(name, "l") or eq(name, "n") or eq(name, "t") or eq(name, "i") or
-            eq(name, "d") or eq(name, "z") or eq(name, "zt") or eq(name, "k") or eq(name, "c") or eq(name, "threads") or
-            eq(name, "w") or eq(name, "rc") or eq(name, "report") or eq(name, "b") or eq(name, "cq") or eq(name, "memory");
-        if (!known) {
+        if (switchInfo(name) == null) {
             setError(error_buffer, tokens.unknown_switch);
             return false;
         }
