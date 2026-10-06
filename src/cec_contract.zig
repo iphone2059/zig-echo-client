@@ -9,33 +9,40 @@ pub const version = "echo-binary-contract-v1";
 
 /// The value switches this client accepts, as compile-time data. The parser asks the table instead
 /// of spelling every switch name out at each use, so the accepted set lives in exactly one place.
+/// Which protocol a switch belongs to; the parser rejects a switch used with the wrong one.
+pub const Scope = enum { both, tcp_only, udp_only };
+
 pub const Switch = struct {
     name: []const u8,
     minimum: u64,
     maximum: u64,
+    scope: Scope,
 };
 
 pub const switch_table = [_]Switch{
-    .{ .name = "p", .minimum = 0, .maximum = 0 },
-    .{ .name = "r", .minimum = 1, .maximum = 65535 },
-    .{ .name = "l", .minimum = 0, .maximum = 65535 },
-    .{ .name = "n", .minimum = 0, .maximum = std.math.maxInt(u64) },
-    .{ .name = "t", .minimum = 1, .maximum = std.math.maxInt(u32) },
-    .{ .name = "i", .minimum = 0, .maximum = std.math.maxInt(u32) },
-    .{ .name = "d", .minimum = 0, .maximum = 0 },
-    .{ .name = "z", .minimum = 1, .maximum = types.maximum_tcp_batch_bytes },
-    .{ .name = "zt", .minimum = 1, .maximum = types.maximum_tcp_batch_bytes },
-    .{ .name = "k", .minimum = 1, .maximum = 65536 },
-    .{ .name = "c", .minimum = 1, .maximum = 1048576 },
-    .{ .name = "threads", .minimum = 1, .maximum = 64 },
-    .{ .name = "w", .minimum = 1, .maximum = std.math.maxInt(u32) },
-    .{ .name = "rc", .minimum = 0, .maximum = std.math.maxInt(i32) },
-    .{ .name = "report", .minimum = 1, .maximum = std.math.maxInt(u32) },
-    .{ .name = "b", .minimum = 0, .maximum = std.math.maxInt(i32) },
-    .{ .name = "cq", .minimum = 64, .maximum = 1048576 },
-    .{ .name = "memory", .minimum = 1048576, .maximum = std.math.maxInt(u64) },
+    .{ .name = "p", .minimum = 0, .maximum = 0, .scope = .both },
+    .{ .name = "r", .minimum = 1, .maximum = 65535, .scope = .both },
+    .{ .name = "l", .minimum = 0, .maximum = 65535, .scope = .both },
+    .{ .name = "n", .minimum = 0, .maximum = std.math.maxInt(u64), .scope = .both },
+    .{ .name = "t", .minimum = 1, .maximum = std.math.maxInt(u32), .scope = .both },
+    .{ .name = "i", .minimum = 0, .maximum = std.math.maxInt(u32), .scope = .both },
+    .{ .name = "d", .minimum = 0, .maximum = 0, .scope = .both },
+    .{ .name = "z", .minimum = 1, .maximum = types.maximum_tcp_batch_bytes, .scope = .both },
+    .{ .name = "zt", .minimum = 1, .maximum = types.maximum_tcp_batch_bytes, .scope = .both },
+    .{ .name = "k", .minimum = 1, .maximum = 65536, .scope = .tcp_only },
+    .{ .name = "c", .minimum = 1, .maximum = 1048576, .scope = .both },
+    .{ .name = "threads", .minimum = 1, .maximum = 64, .scope = .both },
+    .{ .name = "w", .minimum = 1, .maximum = std.math.maxInt(u32), .scope = .both },
+    .{ .name = "rc", .minimum = 0, .maximum = std.math.maxInt(i32), .scope = .both },
+    .{ .name = "report", .minimum = 1, .maximum = std.math.maxInt(u32), .scope = .both },
+    .{ .name = "b", .minimum = 0, .maximum = std.math.maxInt(i32), .scope = .both },
+    .{ .name = "cq", .minimum = 64, .maximum = 1048576, .scope = .both },
+    .{ .name = "memory", .minimum = 1048576, .maximum = std.math.maxInt(u64), .scope = .both },
 };
 
+comptime {
+    if (switchInfo("k").?.scope != .tcp_only) @compileError("switch k must stay TCP only");
+}
 /// Compile-time lookup: the table is unrolled by the compiler, so a typo here is a build error.
 pub fn switchInfo(name: []const u8) ?Switch {
     inline for (switch_table) |entry| {
