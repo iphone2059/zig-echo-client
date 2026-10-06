@@ -288,7 +288,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
         setError(error_buffer, "a fixed /l port requires /c 1");
         return false;
     }
-    if (out.protocol == .udp and saw_pipeline) {
+    if (out.protocol == .udp and saw_pipeline and switchInfo("k").?.scope == .tcp_only) {
         setError(error_buffer, tokens.protocol_option);
         return false;
     }
