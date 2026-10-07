@@ -293,8 +293,14 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
         return false;
     }
     if (out.help) return true;
-    if (!saw_host or out.protocol == .none) {
-        setError(error_buffer, "target host and /p tcp or /p udp are required");
+    // The baseline reports the missing target first and the missing protocol second, so a bare
+    // invocation and a host-only invocation are different mistakes.
+    if (!saw_host) {
+        setError(error_buffer, "missing-target");
+        return false;
+    }
+    if (out.protocol == .none) {
+        setError(error_buffer, "missing-protocol");
         return false;
     }
     const patterns: u8 = @intFromBool(saw_literal) + @intFromBool(saw_binary) + @intFromBool(saw_printable);
