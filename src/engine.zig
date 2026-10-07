@@ -86,7 +86,7 @@ pub fn buildPattern(options: *const types.Options) ?[]u8 {
     if (options.pattern_kind == .literal_text) return std.unicode.utf16LeToUtf8Alloc(allocator, options.literalUtf16()) catch null;
     const host = std.unicode.utf16LeToUtf8Alloc(allocator, options.hostUtf16()) catch return null;
     defer allocator.free(host);
-    return std.fmt.allocPrint(allocator, "C++ echo from {s}", .{host}) catch null;
+    return std.fmt.allocPrint(allocator, "echo from {s}", .{host}) catch null;
 }
 
 fn sampleCount(metrics: *const Metrics) u64 {
@@ -209,4 +209,3 @@ pub fn runClient(options: *const types.Options, stop: *std.atomic.Value(bool)) t
     if (bench_config.enabled) printBenchLatency(workers[0..initialized]);
     return @fromBackingInt(@intCast(contract.classifyResult(echoed, corrupted, lost, metrics.network_errors.load(.monotonic), fatal.load(.acquire), stop.load(.acquire))));
 }
-
