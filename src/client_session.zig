@@ -96,7 +96,8 @@ pub fn postReceive(session: *Session) bool {
 pub fn beginAttempt(session: *Session) bool {
     const worker = session.owner.?;
     const requested: u64 = if (worker.options.?.protocol == .tcp) worker.options.?.pipeline_depth else 1;
-    const granted = contract.claimAttempts(&worker.metrics.?.claimed, worker.options.?.echo_count, requested);
+    const granted = contract.claimSessionAttempts(&session.claimed, worker.options.?.echo_count, requested);
+    if (granted != 0) _ = worker.metrics.?.claimed.fetchAdd(granted, .monotonic);
     if (granted == 0) {
         markDone(session);
         return true;
@@ -297,4 +298,3 @@ pub fn stopWorker(worker: *Worker) void {
         }
     }
 }
-

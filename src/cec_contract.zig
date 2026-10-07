@@ -99,6 +99,21 @@ pub fn claimAttempts(claimed: *std.atomic.Value(u64), limit: u64, requested: u64
     }
 }
 
+/// /n is a per-session quota. The grant is computed against the session's own claimed counter,
+/// while the worker keeps the aggregate of every grant for the terminal accounting. A single worker
+/// thread owns its sessions, so a plain counter is enough here.
+pub fn claimSessionAttempts(claimed: *u64, limit: u64, requested: u64) u64 {
+    if (requested == 0) return 0;
+    if (limit == 0) {
+        claimed.* += requested;
+        return requested;
+    }
+    if (claimed.* >= limit) return 0;
+    const granted = @min(requested, limit - claimed.*);
+    claimed.* += granted;
+    return granted;
+}
+
 pub fn unclaimedEchoes(limit: u64, claimed: u64, controlled_stop: bool) u64 {
     if (controlled_stop or limit == 0 or claimed >= limit) return 0;
     return limit - claimed;

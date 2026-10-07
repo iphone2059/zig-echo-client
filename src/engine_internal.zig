@@ -71,6 +71,8 @@ pub const Session = struct {
     index: u32 = 0,
     outstanding: u32 = 0,
     requested_echoes: u64 = 0,
+    /// Echoes this session has already been granted, so the /n quota is spent per session.
+    claimed: u64 = 0,
     attempt_bytes: usize = 0,
     send_offset: usize = 0,
     received_bytes: usize = 0,
@@ -157,4 +159,3 @@ pub fn percentile(metrics: *const Metrics, total: u64, numerator: u64, denominat
     }
     return @as(u64, 1) << 63;
 }
-
