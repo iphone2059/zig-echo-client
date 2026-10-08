@@ -202,7 +202,10 @@ pub fn runClient(options: *const types.Options, stop: *std.atomic.Value(bool)) t
         if (!all_done) c.Sleep(10);
     }
     for (workers[0..initialized]) |*worker| destroyWorker(worker);
-    const never_claimed = contract.unclaimedEchoes(options.echo_count, metrics.claimed.load(.monotonic), stop.load(.acquire));
+    // /n is a per-session quota, so the run the command line describes is /n times the session
+    // count; a run that never connected therefore reports the whole size as never claimed.
+    const run_quota = options.echo_count * @as(u64, options.session_count);
+    const never_claimed = contract.unclaimedEchoes(run_quota, metrics.claimed.load(.monotonic), stop.load(.acquire));
     if (never_claimed != 0) _ = metrics.lost.fetchAdd(never_claimed, .monotonic);
     const echoed = metrics.echoed.load(.monotonic);
     const corrupted = metrics.corrupted.load(.monotonic);
