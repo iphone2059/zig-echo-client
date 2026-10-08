@@ -18,7 +18,7 @@ foreach ($mode in @('notify_failure', 'corrupt_cq', 'invalid_transition', 'contr
     $stderr = Join-Path ([IO.Path]::GetTempPath()) "zig-client-fault-$id-err.txt"
     $process = $null
     try {
-        $process = Start-Process -FilePath $driver -ArgumentList $mode -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $process = Start-Process -FilePath $driver -ArgumentList $mode -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         if (-not $process.WaitForExit(5000)) {
             Stop-Process -Id $process.Id -Force
             throw "$mode did not terminate"

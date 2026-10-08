@@ -54,7 +54,7 @@ $stderrPath = Join-Path $runDirectory 'stderr.txt'
 $metadataPath = Join-Path $runDirectory 'run.json'
 
 $timer = [Diagnostics.Stopwatch]::StartNew()
-$process = Start-Process -FilePath $clientExe -ArgumentList $clientArguments -PassThru -WindowStyle Hidden `
+$process = Start-Process -FilePath $clientExe -ArgumentList $clientArguments -PassThru -NoNewWindow `
     -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
 $timedOut = $false
 try {

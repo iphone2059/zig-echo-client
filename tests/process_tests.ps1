@@ -22,7 +22,7 @@ function Start-Peer([string]$protocol, [int]$port, [string]$mode = 'echo') {
     $ready = Join-Path ([IO.Path]::GetTempPath()) ("zig-client-peer-" + [Guid]::NewGuid().ToString('N') + '.txt')
     $errorPath = "$ready.stderr"
     $script = Join-Path $PSScriptRoot 'loopback_peer.ps1'
-    $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', "`"$script`"", '-Protocol', $protocol, '-Port', "$port", '-Mode', $mode, '-ReadyPath', "`"$ready`"") -WindowStyle Hidden -PassThru -RedirectStandardError $errorPath
+    $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', "`"$script`"", '-Protocol', $protocol, '-Port', "$port", '-Mode', $mode, '-ReadyPath', "`"$ready`"") -NoNewWindow -PassThru -RedirectStandardError $errorPath
     $until = [DateTime]::UtcNow.AddSeconds(10)
     while ([DateTime]::UtcNow -lt $until) {
         if (Test-Path -LiteralPath $ready) { return [pscustomobject]@{ Process = $process; Ready = $ready; ErrorPath = $errorPath } }
@@ -153,7 +153,7 @@ $stderr = Join-Path ([IO.Path]::GetTempPath()) "zig-client-reconnect-$id-err.txt
 $clientProcess = $null
 $peer = $null
 try {
-    $clientProcess = Start-Process -FilePath $client -ArgumentList @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '1', '/c', '1', '/rc', '1', '/t', '1', '/w', '5', '/stats') -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $clientProcess = Start-Process -FilePath $client -ArgumentList @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '1', '/c', '1', '/rc', '1', '/t', '1', '/w', '5', '/stats') -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     Start-Sleep -Milliseconds 1200
     $peer = Start-Peer 'tcp' $port
     if (-not $clientProcess.WaitForExit(10000)) {

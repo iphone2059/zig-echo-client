@@ -25,7 +25,7 @@ function Invoke-ClientCase([string[]]$arguments, [string[]]$expected) {
     $errPath = Join-Path ([IO.Path]::GetTempPath()) "zig-interop-client-$id-err.txt"
     $process = $null
     try {
-        $process = Start-Process -FilePath $client -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+        $process = Start-Process -FilePath $client -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
         if (-not $process.WaitForExit(10000)) {
             Stop-Process -Id $process.Id -Force
             throw "client timed out: $($arguments -join ' ')"
@@ -56,7 +56,7 @@ foreach ($protocol in @('tcp', 'udp')) {
     }
     $process = $null
     try {
-        $process = Start-Process -FilePath $server -ArgumentList $serverArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+        $process = Start-Process -FilePath $server -ArgumentList $serverArguments -NoNewWindow -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
         Start-Sleep -Milliseconds 400
         if ($process.HasExited) { throw "server exited before acceptance: $($process.ExitCode); $(Get-Content -LiteralPath $errPath -Raw)" }
         if ($protocol -eq 'tcp') {
