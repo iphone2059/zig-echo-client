@@ -17,9 +17,11 @@ const allocator = std.heap.page_allocator;
 
 pub const WorkerResources = internal.WorkerResources;
 
+/// The reference resolves /threads, or the active processor count clamped to [1, 64], and never
+/// more workers than sessions. The contract owns the rule so the parser's capacity budgets and the
+/// run's actual split can never disagree.
 pub fn workerCount(sessions: u32, requested: u32) u32 {
-    const automatic = @max(@as(u32, 1), @min(@as(u32, 32), c.GetActiveProcessorCount(c.ALL_PROCESSOR_GROUPS)));
-    return @min(sessions, if (requested == 0) automatic else requested);
+    return @intCast(contract.resolveWorkerCount(requested, sessions));
 }
 
 pub fn partitionSessions(total: u32, workers: u32, index: u32) u32 {

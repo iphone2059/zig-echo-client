@@ -48,7 +48,9 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
     $stderr = Join-Path ([IO.Path]::GetTempPath()) "zig-client-$id-err.txt"
     $process = $null
     try {
-        $process = Start-Process -FilePath $client -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        # -NoNewWindow keeps the launch on CreateProcess; ShellExecute can raise a SmartScreen
+        # prompt for a freshly built binary and then report the run as cancelled.
+        $process = Start-Process -FilePath $client -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         if (-not $process.WaitForExit(15000)) {
             Stop-Process -Id $process.Id -Force
             throw "client timeout: $($arguments -join ' ')"
@@ -75,29 +77,34 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
 }
 
 [void](Invoke-Client @('/h') 0 @('Usage: zig-echo-client target /p tcp|udp', 'Data I/O is always RIO'))
-[void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/d', '') 1 @('Usage: zig-echo-client target /p tcp|udp') @('Invalid arguments:'))
-[void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', '7', '/n', '17', '/c', '64', '/threads', '1', '/cq', '64', '/stats') 4 @('final ', 'echoed=0', 'lost=17', 'network_errors=0') @('client worker IOCP/CQ/arena capacity'))
+# A usage error puts the diagnostic and the usage text on stderr and leaves stdout empty, exactly
+# as the reference does; it is not a run that reports statistics.
+[void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/d', '') 1 @() @('Invalid arguments: missing-value', 'Usage: zig-echo-client target /p tcp|udp'))
+# One attempt is one receive plus one send, so 64 sessions in one shard need 128 completion-queue
+# entries. The reference rejects that in the parser, so no worker is ever started for it.
+[void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', '7', '/n', '17', '/c', '64', '/threads', '1', '/cq', '64', '/stats') 1 @() @('Invalid arguments: cq-capacity'))
 
 $port = Get-FreePort 'udp'
 $peer = Start-Peer 'udp' $port
 try {
-    $sampleOutput = Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '13', '/c', '8', '/threads', '2', '/zt', '128', '/t', '2', '/stats') 0 @('final ', 'sessions=8', 'echoed=13', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=1664', 'latency_sample=batch')
+    # /n is a per-session quota, so eight sessions of thirteen echoes are 104 echoes and 13312 bytes.
+    $sampleOutput = Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '13', '/c', '8', '/threads', '2', '/zt', '128', '/t', '2', '/stats') 0 @('final ', 'sessions=8', 'echoed=104', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=13312', 'latency_sample=batch')
     if ($BenchHistogram) {
-        if ($sampleOutput -notmatch '(?m)^bench_latency_sample=batch bench_samples=13 ') { throw "benchmark histogram count must equal 13 completed UDP batches: $sampleOutput" }
+        if ($sampleOutput -notmatch '(?m)^bench_latency_sample=batch bench_samples=104 ') { throw "benchmark histogram count must equal 104 completed UDP batches: $sampleOutput" }
     } elseif ($sampleOutput.Contains('bench_latency_sample=')) { throw "default build emitted benchmark-only latency fields: $sampleOutput" }
-    [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '5', '/c', '4', '/threads', '2', '/z', '65507', '/t', '2', '/stats') 0 @('echoed=5', 'lost=0', 'bytes=327535'))
-    [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '4', '/c', '2', '/threads', '2', '/i', '50', '/zt', '128', '/t', '2', '/stats') 0 @('echoed=4', 'lost=0', 'bytes=512'))
+    [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '5', '/c', '4', '/threads', '2', '/z', '65507', '/t', '2', '/stats') 0 @('echoed=20', 'lost=0', 'bytes=1310140'))
+    [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '4', '/c', '2', '/threads', '2', '/i', '50', '/zt', '128', '/t', '2', '/stats') 0 @('echoed=8', 'lost=0', 'bytes=1024'))
     [void](Invoke-Client @('127.0.0.1', '/p', 'udp', '/r', "$port", '/n', '0', '/c', '1', '/i', '50', '/w', '2', '/report', '1', '/t', '2', '/stats') 0 @('report ', 'final ', 'corrupted=0', 'lost=0'))
 } finally { Stop-Peer $peer }
 
 $port = Get-FreePort 'tcp'
 $peer = Start-Peer 'tcp' $port
 try {
-    $sampleOutput = Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '17', '/c', '8', '/threads', '2', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('sessions=8', 'echoed=17', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=69632', 'latency_sample=batch')
+    $sampleOutput = Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '17', '/c', '8', '/threads', '2', '/k', '8', '/z', '4096', '/t', '2', '/stats') 0 @('sessions=8', 'echoed=136', 'corrupted=0', 'lost=0', 'network_errors=0', 'bytes=557056', 'latency_sample=batch')
     if ($BenchHistogram) {
-        if ($sampleOutput -notmatch '(?m)^bench_latency_sample=batch bench_samples=3 ') { throw "benchmark histogram count must equal 3 completed TCP batches, not 17 echoes: $sampleOutput" }
+        if ($sampleOutput -notmatch '(?m)^bench_latency_sample=batch bench_samples=24 ') { throw "benchmark histogram count must equal 24 completed TCP batches (3 per session x 8), not 136 echoes: $sampleOutput" }
     } elseif ($sampleOutput.Contains('bench_latency_sample=')) { throw "default build emitted benchmark-only latency fields: $sampleOutput" }
-    [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '1', '/c', '8', '/threads', '2', '/k', '8', '/zt', '128', '/t', '2', '/stats') 0 @('echoed=1', 'lost=0', 'bytes=128'))
+    [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '1', '/c', '8', '/threads', '2', '/k', '8', '/zt', '128', '/t', '2', '/stats') 0 @('echoed=8', 'lost=0', 'bytes=1024'))
     [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/r', "$port", '/n', '0', '/c', '2', '/threads', '2', '/k', '1', '/i', '50', '/zt', '128', '/t', '2', '/w', '1', '/stats') 0 @('final ', 'sessions=2', 'corrupted=0', 'lost=0', 'latency_sample=batch'))
 } finally { Stop-Peer $peer }
 

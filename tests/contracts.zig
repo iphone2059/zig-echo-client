@@ -31,9 +31,47 @@ test "client rejects empty values conflicts and malformed WTF-8" {
     try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/n", "+1" }, &options, &error_buffer));
     try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/n", "1_0" }, &options, &error_buffer));
     try std.testing.expect(!parse(&.{ "127.0.0.1", "/p", "tcp", "/rc", "-1" }, &options, &error_buffer));
-    try std.testing.expectEqualStrings("numeric switch has an invalid value", std.mem.sliceTo(&error_buffer, 0));
+    // The diagnostic is the reference token, not prose: every case below is a measured
+    // reference answer for the same command line.
+    try std.testing.expectEqualStrings("invalid-number", std.mem.sliceTo(&error_buffer, 0));
     try std.testing.expect(parse(&.{ "/127.0.0.1", "/p", "tcp" }, &options, &error_buffer));
     try std.testing.expect(parse(&.{ "-1", "/p", "tcp" }, &options, &error_buffer));
+}
+
+test "client diagnostics are the reference tokens" {
+    var options: client.types.Options = .{};
+    var error_buffer: [client.types.error_capacity]u8 = @splat(0);
+    const cases = [_]struct { argv: []const []const u8, token: []const u8 }{
+        .{ .argv = &.{}, .token = "missing-target" },
+        .{ .argv = &.{"127.0.0.1"}, .token = "missing-protocol" },
+        .{ .argv = &.{ "/p", "tcp" }, .token = "missing-target" },
+        .{ .argv = &.{ "127.0.0.1", "127.0.0.2", "/p", "tcp" }, .token = "unexpected-target" },
+        .{ .argv = &.{ "/c", "1", "/threads", "2", "/p", "tcp" }, .token = "out-of-range" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/d", "x", "/z", "8" }, .token = "conflicting-payload" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "udp", "/k", "1" }, .token = "protocol-option" },
+        .{ .argv = &.{ "127.0.0.1", "/k", "1", "/p", "udp" }, .token = "protocol-option" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/l", "7000", "/c", "2" }, .token = "local-port-conflict" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/l", "7000", "/rc", "1" }, .token = "local-port-conflict" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "udp", "/z", "65508" }, .token = "payload-size" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/k", "65536", "/z", "65536" }, .token = "payload-size" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/n", "18446744073709551615", "/c", "1048576" }, .token = "quota-overflow" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/c", "200", "/threads", "4", "/cq", "64" }, .token = "cq-capacity" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/k", "2", "/z", "300000", "/memory", "1048576" }, .token = "memory-capacity" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "sctp" }, .token = "out-of-range" },
+        .{ .argv = &.{"/q=1"}, .token = "unexpected-value" },
+        .{ .argv = &.{"/r="}, .token = "missing-value" },
+        .{ .argv = &.{"/r"}, .token = "missing-value" },
+        .{ .argv = &.{"/zzz"}, .token = "unknown-switch" },
+        .{ .argv = &.{ "127.0.0.1", "/p", "tcp", "/cq", "63" }, .token = "out-of-range" },
+        // /h suppresses only the mandatory arguments; the budgets still apply.
+        .{ .argv = &.{ "/h", "/p", "tcp", "/c", "200", "/threads", "4", "/cq", "64" }, .token = "cq-capacity" },
+        .{ .argv = &.{ "/h", "/d", "x", "/z", "8" }, .token = "conflicting-payload" },
+    };
+    for (cases) |case| {
+        try std.testing.expect(!parse(case.argv, &options, &error_buffer));
+        try std.testing.expectEqualStrings(case.token, std.mem.sliceTo(&error_buffer, 0));
+    }
+    try std.testing.expect(parse(&.{ "/h", "/p", "tcp", "/n", "1", "/d", "x" }, &options, &error_buffer));
 }
 
 test "client strict UTF-16 payload conversion rejects surrogate halves" {

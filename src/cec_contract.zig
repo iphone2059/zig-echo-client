@@ -58,6 +58,17 @@ pub const tokens = struct {
     pub const invalid_number = "invalid-number";
     pub const out_of_range = "out-of-range";
     pub const unknown_switch = "unknown-switch";
+    pub const unexpected_value = "unexpected-value";
+    pub const missing_value = "missing-value";
+    pub const conflicting_payload = "conflicting-payload";
+    pub const local_port_conflict = "local-port-conflict";
+    pub const quota_overflow = "quota-overflow";
+    pub const payload_size = "payload-size";
+    pub const memory_capacity = "memory-capacity";
+    pub const cq_capacity = "cq-capacity";
+    pub const missing_target = "missing-target";
+    pub const missing_protocol = "missing-protocol";
+    pub const unexpected_target = "unexpected-target";
 };
 
 /// Usage text, printed on stdout for a valid /h command line and on stderr for a usage error.
@@ -69,6 +80,7 @@ pub const usage =
     "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n";
 
 const std = @import("std");
+const win32 = @import("win32.zig");
 
 pub fn checkedProduct(left: usize, right: usize) ?usize {
     const pair = @mulWithOverflow(left, right);
@@ -206,28 +218,35 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
     var saw_literal = false;
     var saw_binary = false;
     var saw_printable = false;
+    // A second positional is reported after the cross-field rules, exactly as the reference does.
+    var saw_extra_target = false;
+    // UTF-8 byte counts, which is how the reference measures a payload before any session exists.
+    var literal_bytes: u64 = 0;
+    var host_bytes: u64 = 0;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
         const token = argv[index];
         if (!isSwitch(token)) {
-            if (saw_host or token.len == 0 or !copyWtf16(token, &out.host, &out.host_len)) {
+            if (saw_host) {
+                saw_extra_target = true;
+                continue;
+            }
+            if (token.len == 0 or !copyWtf16(token, &out.host, &out.host_len)) {
                 setError(error_buffer, "client requires exactly one valid target host");
                 return false;
             }
             saw_host = true;
+            host_bytes = token.len;
             continue;
         }
         const body = if (token[0] == '-' and token.len > 1 and token[1] == '-') token[2..] else token[1..];
         const separator = std.mem.indexOfScalar(u8, body, '=');
         const name = if (separator) |position| body[0..position] else body;
         const inline_value: ?[]const u8 = if (separator) |position| body[position + 1 ..] else null;
-        if (inline_value) |value| if (value.len == 0) {
-            setError(error_buffer, "switch requires a non-empty inline value");
-            return false;
-        };
         if (eq(name, "q") or eq(name, "quiet") or eq(name, "stats") or eq(name, "h") or eq(name, "help")) {
             if (inline_value != null) {
-                setError(error_buffer, "flag switch does not accept a value");
+                // A flag never takes a value, and an empty one is still a value.
+                setError(error_buffer, tokens.unexpected_value);
                 return false;
             }
             if (eq(name, "q") or eq(name, "quiet")) out.quiet = true;
@@ -245,19 +264,21 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
         }
         const value = inline_value orelse value: {
             if (index + 1 >= argv.len or isSwitch(argv[index + 1])) {
-                setError(error_buffer, "switch requires a non-empty value");
+                setError(error_buffer, tokens.missing_value);
                 return false;
             }
             index += 1;
             break :value argv[index];
         };
         if (value.len == 0) {
-            setError(error_buffer, "switch requires a non-empty value");
+            setError(error_buffer, tokens.missing_value);
             return false;
         }
         if (eq(name, "p")) {
+            // The reference matches the protocol keyword itself and reports the parse failure as
+            // an out-of-range value, not as a protocol-specific message.
             if (eq(value, "tcp")) out.protocol = .tcp else if (eq(value, "udp")) out.protocol = .udp else {
-                setError(error_buffer, "/p requires tcp or udp");
+                setError(error_buffer, tokens.out_of_range);
                 return false;
             }
             continue;
@@ -268,6 +289,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
                 return false;
             }
             out.pattern_kind = .literal_text;
+            literal_bytes = value.len;
             saw_literal = true;
             continue;
         }
@@ -299,53 +321,115 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             return false;
         }
     }
-    if (out.local_port != 0 and out.session_count != 1) {
-        setError(error_buffer, "a fixed /l port requires /c 1");
+    // The cross-field rules keep the reference's precedence: the worker split first, then the
+    // positional arguments, the payload conflict, the protocol options, the local-port rules, the
+    // quota and only then the payload and capacity budgets.
+    if (out.worker_count > out.session_count) {
+        setError(error_buffer, tokens.out_of_range);
+        return false;
+    }
+    if (saw_extra_target) {
+        setError(error_buffer, tokens.unexpected_target);
+        return false;
+    }
+    // The baseline reports the missing target first and the missing protocol second, so a bare
+    // invocation and a host-only invocation are different mistakes. /h suppresses only these two
+    // checks; every other rule still applies.
+    if (!out.help and !saw_host) {
+        setError(error_buffer, tokens.missing_target);
+        return false;
+    }
+    if (!out.help and out.protocol == .none) {
+        setError(error_buffer, tokens.missing_protocol);
+        return false;
+    }
+    // @intFromBool is u1, so the sum has to be widened first: two set flags would otherwise
+    // overflow the u1 addition and the conflict would go unnoticed.
+    const patterns: u8 = @as(u8, @intFromBool(saw_literal)) +
+        @as(u8, @intFromBool(saw_binary)) +
+        @as(u8, @intFromBool(saw_printable));
+    if (patterns > 1) {
+        setError(error_buffer, tokens.conflicting_payload);
         return false;
     }
     if (out.protocol == .udp and saw_pipeline and switchInfo("k").?.scope == .tcp_only) {
         setError(error_buffer, tokens.protocol_option);
         return false;
     }
-    if (out.help) return true;
-    // The baseline reports the missing target first and the missing protocol second, so a bare
-    // invocation and a host-only invocation are different mistakes.
-    if (!saw_host) {
-        setError(error_buffer, "missing-target");
+    if (out.local_port != 0 and
+        (out.session_count != 1 or (out.protocol == .tcp and out.reconnect_seconds >= 0)))
+    {
+        setError(error_buffer, tokens.local_port_conflict);
         return false;
     }
-    if (out.protocol == .none) {
-        setError(error_buffer, "missing-protocol");
+    if (out.session_count != 0 and out.echo_count > std.math.maxInt(u64) / @as(u64, out.session_count)) {
+        setError(error_buffer, tokens.quota_overflow);
         return false;
     }
-    const patterns: u8 = @intFromBool(saw_literal) + @intFromBool(saw_binary) + @intFromBool(saw_printable);
-    if (patterns > 1) {
-        setError(error_buffer, "use exactly one of /d, /z, or /zt");
+    // Nothing else can be validated without a protocol, which is how /h alone succeeds.
+    if (out.protocol == .none) return true;
+    // Each worker owns its own CQ and its own registered arena, so the largest shard decides both
+    // budgets.
+    const workers = resolveWorkerCount(out.worker_count, out.session_count);
+    const shard: u64 = (@as(u64, out.session_count) + workers - 1) / workers;
+    // The effective payload length is known before any session exists.
+    const pattern_bytes: u64 = switch (out.pattern_kind) {
+        .binary_counter, .printable_counter => out.pattern_bytes,
+        .literal_text => literal_bytes,
+        .default_text => if (saw_host) default_text_prefix.len + host_bytes else 0,
+    };
+    if (out.protocol == .udp and pattern_bytes > types.maximum_udp_payload) {
+        setError(error_buffer, tokens.payload_size);
         return false;
     }
-    if (out.protocol == .tcp and out.reconnect_seconds >= 0 and out.local_port != 0) {
-        setError(error_buffer, "TCP reconnect cannot use a fixed /l port");
-        return false;
-    }
-    if (out.protocol == .udp and out.pattern_bytes > types.maximum_udp_payload) {
-        setError(error_buffer, "UDP payload must not exceed 65507 bytes");
-        return false;
-    }
-    if (out.pattern_bytes != 0) {
-        const batch = checkedProduct(out.pattern_bytes, out.pipeline_depth) orelse {
-            setError(error_buffer, "TCP payload multiplied by depth overflowed");
+    if (pattern_bytes != 0) {
+        const batch = checkedProduct(@intCast(pattern_bytes), out.pipeline_depth) orelse {
+            setError(error_buffer, tokens.payload_size);
             return false;
         };
         if (batch > types.maximum_tcp_batch_bytes) {
-            setError(error_buffer, "TCP payload multiplied by depth must not exceed 64 MiB");
+            setError(error_buffer, tokens.payload_size);
             return false;
         }
         _ = checkedStorageBytes(out.session_count, batch, out.memory_bytes) orelse {
-            setError(error_buffer, "registered storage exceeds /memory");
+            setError(error_buffer, tokens.memory_capacity);
             return false;
         };
+        // One worker registers its whole shard, and a single registration may not exceed DWORD.
+        const per_session = checkedProduct(batch, 2) orelse {
+            setError(error_buffer, tokens.memory_capacity);
+            return false;
+        };
+        const per_worker = checkedProduct(per_session, @intCast(shard)) orelse {
+            setError(error_buffer, tokens.memory_capacity);
+            return false;
+        };
+        if (per_worker > std.math.maxInt(u32)) {
+            setError(error_buffer, tokens.memory_capacity);
+            return false;
+        }
+    }
+    // One attempt is one receive plus one send whatever /k is, so the largest shard reserves
+    // exactly two operations per session against the completion queue.
+    if (shard * 2 > out.cq_capacity) {
+        setError(error_buffer, tokens.cq_capacity);
+        return false;
     }
     return true;
+}
+
+/// The default payload of the baseline.
+pub const default_text_prefix = "echo from ";
+
+/// Workers the reference would create: /threads, or the active processor count clamped to [1,64],
+/// and never more than there are sessions.
+pub fn resolveWorkerCount(configured: u32, sessions: u32) u64 {
+    if (sessions == 0) return 1;
+    var workers: u64 = configured;
+    if (workers == 0) {
+        workers = std.math.clamp(@as(u64, win32.c.GetActiveProcessorCount(win32.c.ALL_PROCESSOR_GROUPS)), 1, 64);
+    }
+    return @min(workers, sessions);
 }
 
 pub fn parseProcessArgs(args: std.process.Args, allocator: std.mem.Allocator, out: *types.Options, error_buffer: []u8) bool {
