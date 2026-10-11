@@ -683,7 +683,13 @@ pub fn handleRioResult(comptime protocol: types.Protocol, wrk: *Worker, result: 
         },
         .connect, .generation_drained => unreachable,
     }
+    // An attempt settles only when both of its native operations have completed *and* nothing is
+    // still posted for the session. Its request queue holds exactly one outstanding receive and one
+    // outstanding send, so the next attempt may not begin while either is still with the provider.
+    // The reference states this as three terms -- send_done, receive_done and not receive_posted --
+    // and the third one is written out here rather than left implied by the counters being zero.
     if (!entry.send_done or !entry.receive_done) return;
+    if (wrk.transport.slots[entry.index].outstanding() != 0) return;
     const expected = wrk.transport.arena.sendBytes(entry.index, @intCast(entry.attempt_bytes)) orelse
         native.diagnostics.failFast("client send window", c.ERROR_INVALID_DATA);
     const echoed: []const u8 = if (entry.received_bytes == 0)
