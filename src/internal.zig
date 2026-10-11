@@ -177,6 +177,10 @@ pub const session = struct {
         attempt_started_ticks: u64 = 0,
         send_done: bool = false,
         receive_done: bool = false,
+        /// A receive has been emitted for this attempt and has not come home yet. This is the business
+        /// mirror of the posted request, which is what the reference calls receive_posted; the native
+        /// counter is never consulted for a state decision.
+        receive_posted: bool = false,
         attempt_accounted: bool = false,
         reconnect_after_close: bool = false,
 
@@ -287,6 +291,14 @@ pub const session = struct {
             const entry = &core.sessions[index];
             if (entry.state == .closing or entry.state == .done) return out[0..0];
             return out[0..fail(core, entry, now, out, 0)];
+        }
+
+        /// The three terms the reference states for a settled attempt: its send completed, its
+        /// receive completed, and no receive is still posted for it. The request queue holds exactly
+        /// one outstanding receive and one outstanding send, so the next attempt may not begin until
+        /// all three hold.
+        pub fn attemptSettled(entry: *const Session) bool {
+            return entry.send_done and entry.receive_done and !entry.receive_posted;
         }
 
         /// Settles one completed attempt. A verified attempt counts its bytes and its echoes; a
@@ -401,6 +413,7 @@ pub const session = struct {
             entry.deadline_ticks = now +| core.timeout_ticks;
             core.armTimer(entry.index, entry.deadline_ticks);
             const length: u32 = @intCast(attempt_bytes);
+            entry.receive_posted = true;
             var count = core.emit(out, base, .{ .receive = .{ .index = entry.index, .bytes = length } });
             count += core.emit(out, base + count, .{ .send = .{ .index = entry.index, .bytes = length } });
             return count;
