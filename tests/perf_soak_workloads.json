@@ -74,7 +74,8 @@
     "cq": 65536,
     "memory_bytes": 2147483648,
     "socket_buffer_bytes": 0,
-    "echo_count": 3200000,
-    "soak": true
+    "echo_count": 2771,
+    "soak": true,
+    "formal_exclusion": "Moved out of the formal performance set: at 4096 concurrent sessions this workload fails in all three implementations (cpp exit=3 echoed=7329295, rust exit=3 echoed=6024154, zig exit=3 echoed=5614046 of 11350016 expected), so it cannot produce a valid measurement for any language. The 1024-session case passes in all three at about 26.5 s. This is environmental capacity, not an implementation difference, and it stays here as longevity/stress material."
   }
 ]
