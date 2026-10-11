@@ -180,33 +180,8 @@ pub const session = struct {
         attempt_accounted: bool = false,
         reconnect_after_close: bool = false,
 
-        // Native ownership. Only engine.zig reads or writes the fields below, and only while this
-        // session's generation is live.
-        socket: native.socket.Socket = .{},
-        request_queue: c.RIO_RQ = c.RIO_INVALID_RQ,
-        connect_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
-        connect_outstanding: bool = false,
-        send_outstanding: u32 = 0,
-        receive_outstanding: u32 = 0,
-        send_posted_bytes: u32 = 0,
-        receive_posted_bytes: u32 = 0,
-
-        pub fn outstanding(self: *const Session) u32 {
-            return self.send_outstanding + self.receive_outstanding + @intFromBool(self.connect_outstanding);
-        }
-
-        pub fn generationDrained(self: *const Session) bool {
-            return self.outstanding() == 0;
-        }
-
         pub fn isFinished(self: *const Session) bool {
             return self.state == .done;
-        }
-
-        /// Resets the per-generation native accounting. Called only when a generation is opened,
-        /// never while operations of the previous one are still outstanding.
-        pub fn beginGeneration(self: *const Session) void {
-            _ = self;
         }
     };
 
@@ -276,8 +251,6 @@ pub const session = struct {
                         entry.received_bytes = 0;
                         entry.send_at_ticks = 0;
                         entry.reconnect_at_ticks = 0;
-                        entry.socket.deinit();
-                        entry.request_queue = c.RIO_INVALID_RQ;
                         count += wrk.emit(out, count, .{ .connect = index });
                         entry.deadline_ticks = now +| wrk.timeout_ticks;
                         wrk.armTimer(index, entry.deadline_ticks);
@@ -354,13 +327,11 @@ pub const session = struct {
                 return out[0..0];
             }
             const entry = &wrk.sessions[index];
-            if (!entry.generationDrained()) {
+            if (!wrk.slots[index].drained()) {
                 wrk.markFatal();
                 return out[0..0];
             }
             _ = wrk.timers.remove(index);
-            entry.request_queue = c.RIO_INVALID_RQ;
-            entry.socket.deinit();
             if (entry.reconnect_after_close and !wrk.stopping) {
                 entry.state = .reconnecting;
                 entry.reconnect_at_ticks = now +| wrk.reconnect_ticks;
@@ -420,8 +391,6 @@ pub const session = struct {
             entry.attempt_bytes = attempt_bytes;
             entry.send_offset = 0;
             entry.received_bytes = 0;
-            entry.send_posted_bytes = 0;
-            entry.receive_posted_bytes = 0;
             entry.send_done = false;
             entry.receive_done = false;
             entry.attempt_accounted = false;
@@ -593,6 +562,9 @@ pub const worker = struct {
         bench_histogram: metrics.WorkerHistogram = if (metrics.benchmark_enabled) metrics.Histogram{} else {},
 
         sessions: []session.Session = &.{},
+        /// The native state of each session's current generation. The business machine above never
+        /// reaches into it; engine.zig owns every field.
+        slots: []native.transport.Slot = &.{},
         /// The step scratch buffer, split into fixed regions. A scheduler decision runs in one
         /// region, so a step produced while another is being executed can never overwrite the step
         /// being executed.
@@ -690,7 +662,7 @@ pub const worker = struct {
 
         pub fn outstanding(self: *const Worker) u32 {
             var count: u32 = 0;
-            for (self.sessions) |entry| count += entry.outstanding();
+            for (self.slots) |slot| count += slot.outstanding();
             return count;
         }
 
@@ -721,14 +693,16 @@ pub const worker = struct {
         /// queue and its notification state, deregister every buffer, release the single virtual
         /// allocation, free the host-side arrays, and only then close the completion port.
         pub fn release(self: *Worker, allocator: std.mem.Allocator) void {
-            for (self.sessions) |*entry| entry.socket.deinit();
+            for (self.slots) |*slot| slot.close();
             self.completion_queue.deinit();
             self.arena.deinit();
             if (self.sessions.len != 0) allocator.free(self.sessions);
+            if (self.slots.len != 0) allocator.free(self.slots);
             if (self.steps.len != 0) allocator.free(self.steps);
             if (self.timer_nodes.len != 0) allocator.free(self.timer_nodes);
             if (self.timer_positions.len != 0) allocator.free(self.timer_positions);
             self.sessions = &.{};
+            self.slots = &.{};
             self.steps = &.{};
             self.timer_nodes = &.{};
             self.timer_positions = &.{};

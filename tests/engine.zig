@@ -20,6 +20,7 @@ fn testClock() native.clock.Clock {
 /// registered buffer or a completion port it did not create.
 fn buildWorker(
     sessions: []Session,
+    slots: []client.native.transport.Slot,
     steps: []scheduler.Step,
     nodes: []timer.Node,
     positions: []u32,
@@ -31,6 +32,8 @@ fn buildWorker(
     worker.payload_bytes = payload_bytes;
     worker.session_count = @intCast(sessions.len);
     worker.sessions = sessions;
+    worker.slots = slots;
+    for (slots) |*slot| slot.* = .{};
     worker.steps = steps;
     worker.timer_nodes = nodes;
     worker.timer_positions = positions;
@@ -65,14 +68,15 @@ test "client RIO notification drains its queue before one rearm" {
     api.table.RIODequeueCompletion = fakeDequeue;
     api.table.RIONotify = fakeNotify;
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{};
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 1);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 1);
     worker.api = &api;
     worker.completion_queue = .{ .api = &api, .value = @as(c.RIO_CQ, @ptrFromInt(0x1000)), .armed = false };
-    sessions[0].receive_outstanding = 1;
+    slots[0].receive_outstanding = 1;
     notification_trace_len = 0;
     // The queue is only armed while work is in flight.
     engine.maybeArm(&worker);
@@ -88,7 +92,7 @@ test "client RIO notification drains its queue before one rearm" {
     try std.testing.expect(worker.completion_queue.armed);
     // With nothing outstanding the queue stays unarmed, which is what keeps a notification from
     // outliving the work it describes.
-    sessions[0].receive_outstanding = 0;
+    slots[0].receive_outstanding = 0;
     engine.requireNotificationDelivered(&worker.completion_queue.armed);
     engine.maybeArm(&worker);
     try std.testing.expectEqualStrings("NDN", notification_trace[0..notification_trace_len]);
@@ -97,11 +101,12 @@ test "client RIO notification drains its queue before one rearm" {
 
 test "client per-session quota trims the last batch to the remaining grant" {
     var sessions: [2]Session = .{ .{}, .{} };
+    var slots: [2]client.native.transport.Slot = @splat(.{});
     var steps: [6]scheduler.Step = undefined;
     var nodes: [2]timer.Node = undefined;
     var positions: [2]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .echo_count = 17, .pipeline_depth = 8, .session_count = 2 };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 4_096);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 4_096);
     const started = worker.clock.nowTicks();
     const connects = scheduler.start(&worker, started, &steps);
     try std.testing.expectEqual(@as(usize, 2), connects.len);
@@ -130,11 +135,12 @@ test "client per-session quota trims the last batch to the remaining grant" {
 
 test "client latency sample is one completed batch" {
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 4 };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker, started, &steps);
     _ = scheduler.onConnected(&worker, 0, started, &steps);
@@ -153,17 +159,18 @@ test "client partial RIOSend completion reposts only the unsent tail" {
     var api = extensions.rio;
     api.table.RIOSend = recordingSend;
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 100);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 100);
     worker.api = &api;
     worker.arena = try native.arena.Arena.create(&extensions.rio, 1, 128);
     defer worker.arena.deinit();
     sessions[0].state = .active;
     sessions[0].attempt_bytes = 100;
-    sessions[0].send_outstanding = 1;
+    slots[0].send_outstanding = 1;
     sent_offset = 0;
     sent_length = 0;
     const context = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
@@ -178,7 +185,7 @@ test "client partial RIOSend completion reposts only the unsent tail" {
     // registration does not.
     try std.testing.expectEqual(@as(u32, 40), sent_offset);
     try std.testing.expectEqual(@as(u32, 60), sent_length);
-    try std.testing.expectEqual(@as(u32, 1), sessions[0].send_outstanding);
+    try std.testing.expectEqual(@as(u32, 1), slots[0].send_outstanding);
     try std.testing.expectEqual(@as(u64, 40), worker.statistics.sent_bytes);
 }
 
@@ -194,17 +201,18 @@ fn recordingSend(_: c.RIO_RQ, buffers: [*c]c.RIO_BUF, count: c.ULONG, _: c.DWORD
 
 test "client close waits for both posted completions before the generation drains" {
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     worker.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
     const started = worker.clock.nowTicks();
     sessions[0].state = .active;
     sessions[0].requested_echoes = 8;
-    sessions[0].send_outstanding = 1;
-    sessions[0].receive_outstanding = 1;
+    slots[0].send_outstanding = 1;
+    slots[0].receive_outstanding = 1;
     const closing = scheduler.onTransportFailure(&worker, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), closing.len);
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
@@ -236,14 +244,15 @@ test "client close waits for both posted completions before the generation drain
 
 test "client stale generation completions never steer the live state machine" {
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     sessions[0].state = .active;
     sessions[0].requested_echoes = 4;
-    sessions[0].send_outstanding = 1;
+    slots[0].send_outstanding = 1;
     sessions[0].generation = 3;
     // A completion whose generation was already retired is still retired from the ledger, but it
     // must not resume the attempt.
@@ -254,7 +263,7 @@ test "client stale generation completions never steer the live state machine" {
         .SocketContext = null,
         .RequestContext = stale,
     });
-    try std.testing.expectEqual(@as(u32, 0), sessions[0].send_outstanding);
+    try std.testing.expectEqual(@as(u32, 0), slots[0].send_outstanding);
     try std.testing.expect(sessions[0].state == .active);
     try std.testing.expect(!sessions[0].send_done);
     try std.testing.expectEqual(@as(u64, 0), worker.statistics.sent_bytes);
@@ -296,16 +305,17 @@ test "client worker rolls back every acquired stage before publication" {
 
 test "client release barrier requires every completion retired" {
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     sessions[0].state = .done;
     try std.testing.expectEqual(@as(u32, 0), worker.outstanding());
     try std.testing.expect(sessions[0].isFinished());
     // The named boundary itself is exercised by the fault driver, which must terminate the process.
-    sessions[0].receive_outstanding = 1;
+    slots[0].receive_outstanding = 1;
     try std.testing.expectEqual(@as(u32, 1), worker.outstanding());
 }
 
@@ -504,17 +514,18 @@ test "client worker resolution covers every session without empty workers" {
 
 test "a closing generation that never drains is fatal" {
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     worker.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
     const started = worker.clock.nowTicks();
     sessions[0].state = .active;
     sessions[0].requested_echoes = 1;
     // One operation stays in flight, so the generation can never drain on its own.
-    sessions[0].receive_outstanding = 1;
+    slots[0].receive_outstanding = 1;
     const closing = scheduler.onTransportFailure(&worker, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), closing.len);
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
@@ -528,11 +539,12 @@ test "a closing generation that never drains is fatal" {
 
 test "a reconnect is counted at the failure that triggers it" {
     var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .reconnect_seconds = 1 };
-    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     worker.reconnect_enabled = true;
     worker.reconnect_ticks = worker.clock.millisecondsToTicks(1_000);
     worker.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);

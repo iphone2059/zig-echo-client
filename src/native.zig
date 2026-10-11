@@ -524,6 +524,52 @@ pub const arena = struct {
     };
 };
 
+/// The native state of one session's current transport generation.
+///
+/// The business machine in internal.zig decides what should happen; this record owns what the
+/// kernel owns. Keeping the two apart is what lets a session transition be reasoned about without a
+/// socket, and it is why only engine.zig ever touches these fields.
+pub const transport = struct {
+    pub const Slot = struct {
+        socket: socket.Socket = .{},
+        /// The request queue dies with its socket, so it is tracked, never closed separately.
+        request_queue: c.RIO_RQ = c.RIO_INVALID_RQ,
+        connect_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
+        connect_outstanding: bool = false,
+        send_outstanding: u32 = 0,
+        receive_outstanding: u32 = 0,
+        send_posted_bytes: u32 = 0,
+        receive_posted_bytes: u32 = 0,
+
+        /// Operations the provider still owns. A generation may not be released while this is
+        /// non-zero: closing a socket starts cancellation, it does not end the I/O.
+        pub fn outstanding(self: *const Slot) u32 {
+            return self.send_outstanding + self.receive_outstanding + @intFromBool(self.connect_outstanding);
+        }
+
+        pub fn drained(self: *const Slot) bool {
+            return self.outstanding() == 0;
+        }
+
+        /// Releases the generation's kernel objects. The outstanding counters are deliberately
+        /// left alone: closing a socket starts cancellation, it does not retire the operations the
+        /// provider still owns, and the drain barrier depends on those counters staying exact.
+        pub fn close(self: *Slot) void {
+            self.socket.deinit();
+            self.request_queue = c.RIO_INVALID_RQ;
+        }
+
+        /// Opens a fresh generation with no operations and no handles.
+        pub fn reset(self: *Slot) void {
+            self.close();
+            self.send_outstanding = 0;
+            self.receive_outstanding = 0;
+            self.send_posted_bytes = 0;
+            self.receive_posted_bytes = 0;
+        }
+    };
+};
+
 /// The RIO extension table and every object reached through it. RIO exports no importable symbols,
 /// so a table entry is either present or the call is a hard failure; there is no silent fallback.
 pub const rio = struct {

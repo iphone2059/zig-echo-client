@@ -8,8 +8,17 @@ const std = @import("std");
 const client = @import("client");
 const engine = client.engine;
 const c = client.native.sdk.c;
-const Session = client.session.Session;
+const Slot = client.native.transport.Slot;
 const Worker = client.worker.Worker;
+
+/// A worker that owns nothing but one session's native accounting, which is what the release
+/// preconditions inspect.
+fn workerWithOutstanding(outstanding: u32) struct { worker: Worker, slots: [1]Slot } {
+    return .{
+        .worker = undefined,
+        .slots = .{.{ .receive_outstanding = outstanding }},
+    };
+}
 
 pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(std.heap.page_allocator) catch return 2;
@@ -25,17 +34,17 @@ pub fn main(init: std.process.Init) u8 {
     } else if (std.mem.eql(u8, mode, "control_post_failure")) {
         engine.requireControlPost(c.FALSE, 5);
     } else if (std.mem.eql(u8, mode, "outstanding_release")) {
-        var sessions: [1]Session = .{.{ .receive_outstanding = 1 }};
-        var worker: Worker = .{};
-        worker.sessions = &sessions;
-        worker.session_count = 1;
-        engine.requireReleasePreconditions(&worker);
+        var held = workerWithOutstanding(1);
+        held.worker = .{};
+        held.worker.slots = &held.slots;
+        held.worker.session_count = 1;
+        engine.requireReleasePreconditions(&held.worker);
     } else if (std.mem.eql(u8, mode, "outstanding_cq_retirement")) {
-        var sessions: [1]Session = .{.{ .receive_outstanding = 1 }};
-        var worker: Worker = .{};
-        worker.sessions = &sessions;
-        worker.session_count = 1;
-        engine.retireCompletionQueue(&worker);
+        var held = workerWithOutstanding(1);
+        held.worker = .{};
+        held.worker.slots = &held.slots;
+        held.worker.session_count = 1;
+        engine.retireCompletionQueue(&held.worker);
     } else return 2;
     return 0;
 }
