@@ -634,3 +634,55 @@ test "a receive may complete before the send without posting a second attempt" {
     const after_send = scheduler.onSent(&worker.core, 0, started, &steps);
     try std.testing.expect(countSteps(after_send, .send) >= 1);
 }
+
+test "a short datagram is corrupted rather than reassembled as stream data" {
+    // Mirrors udp_short_datagram_is_not_reassembled_as_tcp_stream_data. UDP is message oriented, so a
+    // datagram shorter than the attempt is a corrupted echo and never the first half of the next one.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .udp, .pipeline_depth = 1, .echo_count = 1 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    _ = scheduler.onConnected(&worker.core, 0, started, &steps);
+    _ = scheduler.onSent(&worker.core, 0, started, &steps);
+
+    var echoed: [3]u8 = @splat(0xAB);
+    var expected: [6]u8 = @splat(0xAB);
+    const settled = scheduler.onReceived(&worker.core, 0, &echoed, &expected, started, &steps);
+    try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.corrupted);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.echoes);
+    // The quota is spent, so this is the last attempt and the generation is retired.
+    try std.testing.expectEqual(@as(usize, 1), countSteps(settled, .close));
+}
+
+test "a corrupted receive settles the batch once and continues the quota" {
+    // Mirrors corrupted_receive_settles_the_batch_and_continues_the_quota. Integrity is counted per
+    // attempt: this attempt carried two echo units and is settled as corrupted alone, because
+    // counting it lost as well would settle one attempt twice.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 2, .reconnect_seconds = 1 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    _ = scheduler.onConnected(&worker.core, 0, started, &steps);
+    _ = scheduler.onSent(&worker.core, 0, started, &steps);
+
+    var echoed: [12]u8 = @splat(0xAB);
+    var expected: [6]u8 = @splat(0xAB);
+    const next = scheduler.onReceived(&worker.core, 0, &echoed, &expected, started, &steps);
+    // The next attempt is one whole batch, and the receive is posted before the send.
+    try std.testing.expectEqual(@as(usize, 1), countSteps(next, .receive));
+    try std.testing.expectEqual(@as(usize, 1), countSteps(next, .send));
+    try std.testing.expectEqual(@as(u64, 2), worker.core.statistics.corrupted);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.lost);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.reconnects);
+    try std.testing.expectEqual(client.session.State.active, sessions[0].state);
+}
