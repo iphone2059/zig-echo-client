@@ -118,7 +118,7 @@ pub fn retireCompletionQueue(wrk: *Worker) void {
 /// A worker may release its registered memory only once every operation of every generation has
 /// been retired. Closing a socket starts cancellation; it does not end the lifetime of that I/O.
 pub fn requireReleasePreconditions(wrk: *const Worker) void {
-    if (wrk.outstanding() != 0) {
+    if (outstanding(wrk) != 0) {
         native.diagnostics.failFast("client worker release precondition", c.ERROR_IO_INCOMPLETE);
     }
     for (wrk.sessions) |entry| {
@@ -550,7 +550,7 @@ fn waitAndDrain(comptime protocol: types.Protocol, wrk: *Worker, wait_ms: u32) v
         wrk.notification_deliveries +|= 1;
     } else if (overlapped == null) {
         if (ok == c.FALSE and native_error == c.WAIT_TIMEOUT) {
-            if (wrk.outstanding() != 0) wrk.timeout_wakeups_while_outstanding +|= 1;
+            if (outstanding(wrk) != 0) wrk.timeout_wakeups_while_outstanding +|= 1;
         } else if (key != stop_key) {
             native.diagnostics.failFast("unexpected client IOCP packet", c.ERROR_INVALID_DATA);
         }
@@ -580,9 +580,17 @@ pub fn drainRio(comptime protocol: types.Protocol, wrk: *Worker, budget: u32) vo
 
 /// Re-arms the completion queue only while work is in flight, so a busy worker never pays for a
 /// redundant notification and an idle queue never leaves a notification the provider still owns.
+/// Operations the provider still owns across every session. The native slot owns the count, so the
+/// question is answered here rather than by the business record.
+pub fn outstanding(wrk: *const Worker) u32 {
+    var count: u32 = 0;
+    for (wrk.slots) |slot| count += slot.outstanding();
+    return count;
+}
+
 pub fn maybeArm(wrk: *Worker) void {
     if (wrk.completion_queue.armed) return;
-    if (wrk.outstanding() == 0) return;
+    if (outstanding(wrk) == 0) return;
     requireNotifySuccess(wrk.api.?.notify(wrk.completion_queue.value));
     requireNotificationRearmed(&wrk.completion_queue.armed);
     wrk.notification_arms +|= 1;
@@ -859,6 +867,7 @@ fn closeGeneration(comptime protocol: types.Protocol, wrk: *Worker, index: u32) 
 fn settleDrain(comptime protocol: types.Protocol, wrk: *Worker, entry: *Session) void {
     const slot = &wrk.slots[entry.index];
     if (entry.state != .closing) return;
+    // The transport answers this, and only a drained generation is reported to the business machine.
     if (!slot.drained()) return;
     const region = wrk.acquireRegion();
     dispatch(protocol, wrk, internal.session.scheduler.onGenerationDrained(wrk, entry.index, wrk.clock.nowTicks(), region));
@@ -880,7 +889,7 @@ fn shutdownWorker(comptime protocol: types.Protocol, wrk: *Worker) void {
         }
     }
     const deadline = wrk.clock.nowTicks() +| wrk.clock.millisecondsToTicks(shutdown_timeout_ms);
-    while (wrk.outstanding() != 0) {
+    while (outstanding(wrk) != 0) {
         if (wrk.clock.nowTicks() >= deadline) {
             native.diagnostics.failFast("client shutdown drain", c.ERROR_IO_INCOMPLETE);
         }

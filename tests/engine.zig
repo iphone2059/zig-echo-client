@@ -237,7 +237,7 @@ test "client close waits for both posted completions before the generation drain
         .RequestContext = receive_context,
     });
     try std.testing.expectEqual(client.session.State.done, sessions[0].state);
-    try std.testing.expectEqual(@as(u32, 0), worker.outstanding());
+    try std.testing.expectEqual(@as(u32, 0), engine.outstanding(&worker));
     // The failed attempt's quota is spent exactly once.
     try std.testing.expectEqual(@as(u64, 8), worker.statistics.lost);
 }
@@ -312,11 +312,11 @@ test "client release barrier requires every completion retired" {
     const options = client.types.Options{ .protocol = .tcp };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     sessions[0].state = .done;
-    try std.testing.expectEqual(@as(u32, 0), worker.outstanding());
+    try std.testing.expectEqual(@as(u32, 0), engine.outstanding(&worker));
     try std.testing.expect(sessions[0].isFinished());
     // The named boundary itself is exercised by the fault driver, which must terminate the process.
     slots[0].receive_outstanding = 1;
-    try std.testing.expectEqual(@as(u32, 1), worker.outstanding());
+    try std.testing.expectEqual(@as(u32, 1), engine.outstanding(&worker));
 }
 
 test "client arena registers one send window per slot and one shared receive window" {

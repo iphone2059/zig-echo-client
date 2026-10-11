@@ -318,19 +318,18 @@ pub const session = struct {
             return out[0..beginAttempt(wrk, entry, now, out, 0)];
         }
 
-        /// The second phase: every native operation of the generation has been dequeued, so the
-        /// socket and its request queue may be released and either a reconnect or the terminal state
-        /// follows.
+        /// The second phase: the transport proved that every operation of this generation has been
+        /// dequeued, so either a reconnect or the terminal state follows.
+        ///
+        /// The drain itself is not decided here. Whether the provider still owns an operation is a
+        /// question about the native slot, and engine.zig answers it before emitting this event; the
+        /// business machine is handed the verdict and never inspects native state.
         pub fn onGenerationDrained(wrk: *worker.Worker, index: u32, now: u64, out: []Step) []const Step {
             if (index >= wrk.sessions.len) {
                 wrk.markFatal();
                 return out[0..0];
             }
             const entry = &wrk.sessions[index];
-            if (!wrk.slots[index].drained()) {
-                wrk.markFatal();
-                return out[0..0];
-            }
             _ = wrk.timers.remove(index);
             if (entry.reconnect_after_close and !wrk.stopping) {
                 entry.state = .reconnecting;
@@ -657,12 +656,6 @@ pub const worker = struct {
             for (self.sessions) |entry| {
                 if (entry.active_counted) count += 1;
             }
-            return count;
-        }
-
-        pub fn outstanding(self: *const Worker) u32 {
-            var count: u32 = 0;
-            for (self.slots) |slot| count += slot.outstanding();
             return count;
         }
 
