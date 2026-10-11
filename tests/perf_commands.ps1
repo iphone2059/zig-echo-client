@@ -52,14 +52,31 @@ function Test-BenchmarkRun {
     )
 
     $required = @('exit_code','elapsed_ms','echoed','expected_echo_count','bytes','expected_bytes',
-        'lost','corrupted','network_errors','peer_sha256')
+        'lost','corrupted','network_errors','peer_sha256','optimize_mode')
     foreach ($field in $required) {
         if ($null -eq $Run.PSObject.Properties[$field]) { return $false }
     }
     return $Run.exit_code -eq 0 -and $Run.elapsed_ms -ge 10000 -and
         $Run.echoed -eq $Run.expected_echo_count -and $Run.bytes -eq $Run.expected_bytes -and
         $Run.lost -eq 0 -and $Run.corrupted -eq 0 -and $Run.network_errors -eq 0 -and
-        [string]::Equals($Run.peer_sha256, $ExpectedPeerSha256, [StringComparison]::OrdinalIgnoreCase)
+        [string]::Equals($Run.peer_sha256, $ExpectedPeerSha256, [StringComparison]::OrdinalIgnoreCase) -and
+        $Run.optimize_mode -cin @('Debug', 'ReleaseFast')
+}
+
+function Get-ExecutableOptimizeMode {
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnknown)
+
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $marker = Join-Path $directory 'optimize-mode.txt'
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        if ($AllowUnknown) { return $null }
+        throw "executable optimize mode marker missing: $marker"
+    }
+    $mode = (Get-Content -LiteralPath $marker -Raw).Trim()
+    # An unknown mode is rejected rather than carried into a result. Both build modes install to the
+    # same zig-out\bin, so a benchmark that cannot say which build it measured is not a measurement.
+    if ($mode -cnotin @('Debug', 'ReleaseFast')) { throw "invalid executable optimize mode marker: $marker" }
+    return $mode
 }
 
 function Get-ExecutableCommit {

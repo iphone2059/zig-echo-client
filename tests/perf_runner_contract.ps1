@@ -41,7 +41,7 @@ Assert-True $threw 'zero finite count must be rejected'
 $run = [pscustomobject]@{
     exit_code = 0; elapsed_ms = 10000; echoed = 17; expected_echo_count = 17
     bytes = 2176; expected_bytes = 2176; lost = 0; corrupted = 0
-    network_errors = 0; peer_sha256 = ('a' * 64)
+    network_errors = 0; peer_sha256 = ('a' * 64); optimize_mode = 'ReleaseFast'
 }
 Assert-True (Test-BenchmarkRun -Run $run -ExpectedPeerSha256 ('a' * 64)) 'valid run rejected'
 foreach ($mutation in @(
@@ -52,7 +52,8 @@ foreach ($mutation in @(
     @{ field = 'lost'; value = 1 },
     @{ field = 'corrupted'; value = 1 },
     @{ field = 'network_errors'; value = 1 },
-    @{ field = 'peer_sha256'; value = ('b' * 64) }
+    @{ field = 'peer_sha256'; value = ('b' * 64) },
+    @{ field = 'optimize_mode'; value = 'ReleaseSafe' }
 )) {
     $candidate = $run.PSObject.Copy()
     $candidate.($mutation.field) = $mutation.value
@@ -96,6 +97,27 @@ try {
 } finally {
     if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker }
     Remove-Item -LiteralPath $fixtureDirectory
+}
+
+
+$modeFixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ('perf-mode-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $modeFixtureDirectory
+$modeFixtureExe = Join-Path $modeFixtureDirectory 'frozen.exe'
+$modeMarker = Join-Path $modeFixtureDirectory 'optimize-mode.txt'
+try {
+    $missingModeRejected = $false
+    try { $null = Get-ExecutableOptimizeMode -Path $modeFixtureExe } catch { $missingModeRejected = $true }
+    Assert-True $missingModeRejected 'missing optimize mode marker was accepted'
+    Assert-True ($null -eq (Get-ExecutableOptimizeMode -Path $modeFixtureExe -AllowUnknown)) 'unknown peer mode was invented'
+    Set-Content -LiteralPath $modeMarker -Value 'ReleaseFast' -Encoding ascii
+    Assert-True ((Get-ExecutableOptimizeMode -Path $modeFixtureExe) -ceq 'ReleaseFast') 'frozen ReleaseFast marker was ignored'
+    Set-Content -LiteralPath $modeMarker -Value 'ReleaseSafe' -Encoding ascii
+    $unknownModeRejected = $false
+    try { $null = Get-ExecutableOptimizeMode -Path $modeFixtureExe } catch { $unknownModeRejected = $true }
+    Assert-True $unknownModeRejected 'unknown optimize mode was accepted'
+} finally {
+    if (Test-Path -LiteralPath $modeMarker) { Remove-Item -LiteralPath $modeMarker }
+    Remove-Item -LiteralPath $modeFixtureDirectory
 }
 
 Write-Output 'client performance runner contract passed'
