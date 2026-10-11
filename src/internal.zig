@@ -134,6 +134,11 @@ pub const steps_per_session: usize = 3;
 /// The deepest decision recursion: start -> connect -> post failure -> close -> drained.
 pub const step_levels: u32 = 5;
 
+/// How long a retiring generation may take before the run is declared broken. Cancellation
+/// completion is normally prompt; a provider that never delivers one must not strand the worker in
+/// Closing forever.
+pub const drain_grace_milliseconds: u64 = 5_000;
+
 /// The size of one step region, which is what one scheduler decision may emit.
 pub fn stepRegionBytes(session_count: u32) usize {
     return @as(usize, session_count) * steps_per_session;
@@ -258,7 +263,12 @@ pub const session = struct {
                 }
                 const entry = &wrk.sessions[index];
                 switch (entry.state) {
-                    .connecting, .active => count += fail(wrk, entry, out, count),
+                    .connecting, .active => count += fail(wrk, entry, now, out, count),
+                    .closing => {
+                        // The grace expired: the generation never drained, so no further progress is
+                        // possible and the terminal accounting must not claim a clean stop.
+                        wrk.markFatal();
+                    },
                     .pacing => count += beginAttempt(wrk, entry, now, out, count),
                     .reconnecting => {
                         entry.generation = native.completion.nextGeneration(entry.generation);
@@ -268,7 +278,6 @@ pub const session = struct {
                         entry.reconnect_at_ticks = 0;
                         entry.socket.deinit();
                         entry.request_queue = c.RIO_INVALID_RQ;
-                        wrk.statistics.reconnects +|= 1;
                         count += wrk.emit(out, count, .{ .connect = index });
                         entry.deadline_ticks = now +| wrk.timeout_ticks;
                         wrk.armTimer(index, entry.deadline_ticks);
@@ -297,14 +306,14 @@ pub const session = struct {
         /// The first phase of generation retirement: account the attempt, then ask the engine to
         /// close the transport. The attempt's quota stays spent, so a reconnect only claims what the
         /// run has left instead of handing the failed attempt back.
-        pub fn onTransportFailure(wrk: *worker.Worker, index: u32, out: []Step) []const Step {
+        pub fn onTransportFailure(wrk: *worker.Worker, index: u32, now: u64, out: []Step) []const Step {
             if (index >= wrk.sessions.len) {
                 wrk.markFatal();
                 return out[0..0];
             }
             const entry = &wrk.sessions[index];
             if (entry.state == .closing or entry.state == .done) return out[0..0];
-            return out[0..fail(wrk, entry, out, 0)];
+            return out[0..fail(wrk, entry, now, out, 0)];
         }
 
         /// Settles one completed attempt. A verified attempt counts its bytes and its echoes; a
@@ -349,6 +358,7 @@ pub const session = struct {
                 wrk.markFatal();
                 return out[0..0];
             }
+            _ = wrk.timers.remove(index);
             entry.request_queue = c.RIO_INVALID_RQ;
             entry.socket.deinit();
             if (entry.reconnect_after_close and !wrk.stopping) {
@@ -396,9 +406,9 @@ pub const session = struct {
                 // The quota is exhausted. The generation is retired rather than left open: the peer
                 // must see the connection close as soon as this session has nothing left to echo,
                 // and a slot that keeps a live socket would starve the sessions behind it.
-                _ = wrk.timers.remove(entry.index);
                 entry.reconnect_after_close = false;
                 entry.state = .closing;
+                armClose(wrk, entry, now);
                 return wrk.emit(out, base, .{ .close = entry.index });
             }
             const attempt_bytes = wrk.payload_bytes * @as(usize, @intCast(granted));
@@ -430,17 +440,29 @@ pub const session = struct {
 
         /// A failed generation settles the attempt's whole quota at once, which is what preserves
         /// the ledger identity attempted = pending + echoed + corrupted + lost + cancelled.
-        fn fail(wrk: *worker.Worker, entry: *Session, out: []Step, base: usize) usize {
+        ///
+        /// A reconnect is counted here, at the failure that triggers it, so a stop that arrives while
+        /// the session is waiting to reconnect cannot change the tally.
+        fn fail(wrk: *worker.Worker, entry: *Session, now: u64, out: []Step, base: usize) usize {
             if (!entry.attempt_accounted) {
                 wrk.statistics.lost +|= entry.requested_echoes;
                 entry.settled +|= entry.requested_echoes;
                 entry.attempt_accounted = true;
             }
             wrk.statistics.network_errors +|= 1;
-            _ = wrk.timers.remove(entry.index);
-            entry.reconnect_after_close = wrk.reconnect_enabled and !wrk.stopping;
+            const will_reconnect = wrk.reconnect_enabled and !wrk.stopping;
+            if (will_reconnect) wrk.statistics.reconnects +|= 1;
+            entry.reconnect_after_close = will_reconnect;
             entry.state = .closing;
+            armClose(wrk, entry, now);
             return wrk.emit(out, base, .{ .close = entry.index });
+        }
+
+        /// Every closing generation keeps a deadline: the drain is normally immediate, but a
+        /// provider that never reports the last completion has to end the run rather than hang it.
+        fn armClose(wrk: *worker.Worker, entry: *Session, now: u64) void {
+            entry.deadline_ticks = now +| wrk.drain_grace_ticks;
+            wrk.armTimer(entry.index, entry.deadline_ticks);
         }
 
         /// A session that cannot make progress any more is terminal: it leaves the active set, its
@@ -563,6 +585,8 @@ pub const worker = struct {
         interval_ticks: u64 = 0,
         reconnect_ticks: u64 = 0,
         reconnect_enabled: bool = false,
+        /// The bounded grace a closing generation gets before its silence is fatal.
+        drain_grace_ticks: u64 = 0,
         receive_flags: u32 = 0,
 
         statistics: metrics.Statistics = .{},

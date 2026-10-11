@@ -31,6 +31,8 @@ pub fn build(b: *std.Build) void {
     root_module.addOptions("bench_config", bench_options);
     root_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     root_module.linkSystemLibrary("kernel32", .{ .use_pkg_config = .no });
+    // timeBeginPeriod/timeEndPeriod live in winmm; /i pacing requests a finer wait granularity.
+    root_module.linkSystemLibrary("winmm", .{ .use_pkg_config = .no });
 
     const exe = b.addExecutable(.{ .name = "zig-echo-client", .root_module = root_module });
     b.installArtifact(exe);
@@ -45,6 +47,7 @@ pub fn build(b: *std.Build) void {
     test_module.addOptions("bench_config", bench_options);
     test_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     test_module.linkSystemLibrary("kernel32", .{ .use_pkg_config = .no });
+    test_module.linkSystemLibrary("winmm", .{ .use_pkg_config = .no });
     const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all self-contained client tests");

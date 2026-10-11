@@ -185,6 +185,16 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
         return .usage;
     }
     const clock = native.clock.Clock.init() orelse return .internal;
+    // Pacing is expressed in milliseconds, so the run asks for the finer wait granularity the
+    // reference requests and releases it on every exit path.
+    const paced = options.interval_milliseconds != 0;
+    if (paced and c.timeBeginPeriod(1) != 0) {
+        native.diagnostics.report("timeBeginPeriod(client pacing)", c.GetLastError());
+        return .internal;
+    }
+    defer if (paced) {
+        _ = c.timeEndPeriod(1);
+    };
     const batch_bytes = pattern.len * @as(usize, options.batchCapacity());
     if (batch_bytes == 0 or batch_bytes > types.maximum_tcp_batch_bytes) {
         native.diagnostics.report("payload batch size", c.ERROR_ARITHMETIC_OVERFLOW);
@@ -364,6 +374,7 @@ pub fn initializeWorker(
     wrk.timeout_ticks = clock.millisecondsToTicks(@as(u64, options.timeout_seconds) * 1_000);
     wrk.interval_ticks = clock.millisecondsToTicks(@as(u64, options.interval_milliseconds));
     wrk.reconnect_enabled = options.reconnect_seconds != null;
+    wrk.drain_grace_ticks = clock.millisecondsToTicks(internal.drain_grace_milliseconds);
     wrk.reconnect_ticks = if (options.reconnect_seconds) |seconds| clock.millisecondsToTicks(@as(u64, seconds) * 1_000) else 0;
     if (clock.frequency == 0) return error.Clock;
 
@@ -822,7 +833,7 @@ fn postReceive(wrk: *Worker, entry: *Session) bool {
 
 fn failSession(comptime protocol: types.Protocol, wrk: *Worker, index: u32) void {
     const region = wrk.acquireRegion();
-    dispatch(protocol, wrk, internal.session.scheduler.onTransportFailure(wrk, index, region));
+    dispatch(protocol, wrk, internal.session.scheduler.onTransportFailure(wrk, index, wrk.clock.nowTicks(), region));
     wrk.releaseRegion();
 }
 

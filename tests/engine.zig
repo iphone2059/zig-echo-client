@@ -199,11 +199,13 @@ test "client close waits for both posted completions before the generation drain
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
     var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    worker.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
+    const started = worker.clock.nowTicks();
     sessions[0].state = .active;
     sessions[0].requested_echoes = 8;
     sessions[0].send_outstanding = 1;
     sessions[0].receive_outstanding = 1;
-    const closing = scheduler.onTransportFailure(&worker, 0, &steps);
+    const closing = scheduler.onTransportFailure(&worker, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), closing.len);
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
     try std.testing.expectEqual(@as(u64, 8), worker.statistics.lost);
@@ -498,4 +500,48 @@ test "client worker resolution covers every session without empty workers" {
             try std.testing.expectEqual(count, total);
         }
     }
+}
+
+test "a closing generation that never drains is fatal" {
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    worker.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
+    const started = worker.clock.nowTicks();
+    sessions[0].state = .active;
+    sessions[0].requested_echoes = 1;
+    // One operation stays in flight, so the generation can never drain on its own.
+    sessions[0].receive_outstanding = 1;
+    const closing = scheduler.onTransportFailure(&worker, 0, started, &steps);
+    try std.testing.expectEqual(@as(usize, 1), closing.len);
+    try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
+    // Before the grace expires the slot is simply waiting.
+    _ = scheduler.poll(&worker, started, &steps);
+    try std.testing.expect(!worker.statistics.fatal);
+    // Once it expires the run is broken rather than stranded in Closing forever.
+    _ = scheduler.poll(&worker, started +| worker.drain_grace_ticks +| 1, &steps);
+    try std.testing.expect(worker.statistics.fatal);
+}
+
+test "a reconnect is counted at the failure that triggers it" {
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .reconnect_seconds = 1 };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    worker.reconnect_enabled = true;
+    worker.reconnect_ticks = worker.clock.millisecondsToTicks(1_000);
+    worker.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
+    const started = worker.clock.nowTicks();
+    sessions[0].state = .active;
+    sessions[0].requested_echoes = 4;
+    _ = scheduler.onTransportFailure(&worker, 0, started, &steps);
+    // The tally moves with the failure, not with the timer that later opens the new generation, so
+    // a stop arriving during the wait cannot change it.
+    try std.testing.expectEqual(@as(u64, 1), worker.statistics.reconnects);
+    try std.testing.expect(sessions[0].reconnect_after_close);
 }

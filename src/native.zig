@@ -185,6 +185,10 @@ pub const sdk = struct {
         pub extern fn QueryPerformanceCounter(*LARGE_INTEGER) callconv(.winapi) BOOL;
         pub extern fn QueryPerformanceFrequency(*LARGE_INTEGER) callconv(.winapi) BOOL;
         pub extern fn SetConsoleCtrlHandler(?*const fn (DWORD) callconv(.winapi) BOOL, BOOL) callconv(.winapi) BOOL;
+        /// The multimedia timer resolution request. QPC measures elapsed time; this asks the
+        /// scheduler for a finer wait granularity, and the two are not substitutes.
+        pub extern fn timeBeginPeriod(period: u32) callconv(.winapi) u32;
+        pub extern fn timeEndPeriod(period: u32) callconv(.winapi) u32;
         pub extern fn getenv([*:0]const u8) callconv(.c) ?[*:0]u8;
     };
 
