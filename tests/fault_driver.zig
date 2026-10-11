@@ -36,14 +36,14 @@ pub fn main(init: std.process.Init) u8 {
     } else if (std.mem.eql(u8, mode, "outstanding_release")) {
         var held = workerWithOutstanding(1);
         held.worker = .{};
-        held.worker.slots = &held.slots;
-        held.worker.session_count = 1;
+        held.worker.transport.slots = &held.slots;
+        held.worker.core.session_count = 1;
         engine.requireReleasePreconditions(&held.worker);
     } else if (std.mem.eql(u8, mode, "outstanding_cq_retirement")) {
         var held = workerWithOutstanding(1);
         held.worker = .{};
-        held.worker.slots = &held.slots;
-        held.worker.session_count = 1;
+        held.worker.transport.slots = &held.slots;
+        held.worker.core.session_count = 1;
         engine.retireCompletionQueue(&held.worker);
     } else return 2;
     return 0;

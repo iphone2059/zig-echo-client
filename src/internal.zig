@@ -198,17 +198,17 @@ pub const session = struct {
 
         /// The first attempt of a transport generation is immediate; the interval spaces only later
         /// cycles, matching the baseline behaviour.
-        pub fn start(wrk: *worker.Worker, now: u64, out: []Step) []const Step {
+        pub fn start(core: *worker.Core, now: u64, out: []Step) []const Step {
             var count: usize = 0;
-            for (wrk.sessions) |*entry| {
+            for (core.sessions) |*entry| {
                 if (entry.state != .dormant) continue;
                 entry.state = .connecting;
                 entry.received_bytes = 0;
                 entry.send_at_ticks = 0;
                 entry.reconnect_at_ticks = 0;
-                entry.deadline_ticks = now +| wrk.timeout_ticks;
-                count += wrk.emit(out, count, .{ .connect = entry.index });
-                wrk.armTimer(entry.index, entry.deadline_ticks);
+                entry.deadline_ticks = now +| core.timeout_ticks;
+                count += core.emit(out, count, .{ .connect = entry.index });
+                core.armTimer(entry.index, entry.deadline_ticks);
             }
             return out[0..count];
         }
@@ -216,44 +216,44 @@ pub const session = struct {
         /// Step construction can precede expensive socket preparation. The engine refreshes this
         /// provisional deadline at the native posting boundary, so an earlier session cannot consume
         /// a later session's timeout.
-        pub fn anchorPostedTimeout(wrk: *worker.Worker, index: u32, now: u64) void {
-            if (index >= wrk.sessions.len) {
-                wrk.markFatal();
+        pub fn anchorPostedTimeout(core: *worker.Core, index: u32, now: u64) void {
+            if (index >= core.sessions.len) {
+                core.markFatal();
                 return;
             }
-            const entry = &wrk.sessions[index];
+            const entry = &core.sessions[index];
             if (entry.state != .connecting and entry.state != .active) return;
-            entry.deadline_ticks = now +| wrk.timeout_ticks;
-            wrk.armTimer(index, entry.deadline_ticks);
+            entry.deadline_ticks = now +| core.timeout_ticks;
+            core.armTimer(index, entry.deadline_ticks);
         }
 
         /// Everything that became due: an expired deadline fails the attempt, a pacing timer starts
         /// the next attempt, and a reconnect timer opens a new transport generation.
-        pub fn poll(wrk: *worker.Worker, now: u64, out: []Step) []const Step {
+        pub fn poll(core: *worker.Core, now: u64, out: []Step) []const Step {
             var count: usize = 0;
-            while (wrk.timers.popExpired(now)) |index| {
-                if (index >= wrk.sessions.len) {
-                    wrk.markFatal();
+            while (core.timers.popExpired(now)) |index| {
+                if (index >= core.sessions.len) {
+                    core.markFatal();
                     return out[0..count];
                 }
-                const entry = &wrk.sessions[index];
+                const entry = &core.sessions[index];
                 switch (entry.state) {
-                    .connecting, .active => count += fail(wrk, entry, now, out, count),
+                    .connecting, .active => count += fail(core, entry, now, out, count),
                     .closing => {
                         // The grace expired: the generation never drained, so no further progress is
                         // possible and the terminal accounting must not claim a clean stop.
-                        wrk.markFatal();
+                        core.markFatal();
                     },
-                    .pacing => count += beginAttempt(wrk, entry, now, out, count),
+                    .pacing => count += beginAttempt(core, entry, now, out, count),
                     .reconnecting => {
                         entry.generation = native.completion.nextGeneration(entry.generation);
                         entry.state = .connecting;
                         entry.received_bytes = 0;
                         entry.send_at_ticks = 0;
                         entry.reconnect_at_ticks = 0;
-                        count += wrk.emit(out, count, .{ .connect = index });
-                        entry.deadline_ticks = now +| wrk.timeout_ticks;
-                        wrk.armTimer(index, entry.deadline_ticks);
+                        count += core.emit(out, count, .{ .connect = index });
+                        entry.deadline_ticks = now +| core.timeout_ticks;
+                        core.armTimer(index, entry.deadline_ticks);
                     },
                     else => {},
                 }
@@ -262,60 +262,60 @@ pub const session = struct {
         }
 
         /// A successful connect establishes the generation and starts the first attempt.
-        pub fn onConnected(wrk: *worker.Worker, index: u32, now: u64, out: []Step) []const Step {
-            if (index >= wrk.sessions.len) {
-                wrk.markFatal();
+        pub fn onConnected(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
+            if (index >= core.sessions.len) {
+                core.markFatal();
                 return out[0..0];
             }
-            const entry = &wrk.sessions[index];
+            const entry = &core.sessions[index];
             if (entry.state != .connecting) return out[0..0];
             entry.state = .active;
             entry.active_counted = true;
-            _ = wrk.timers.remove(index);
-            wrk.statistics.connections +|= 1;
-            return out[0..beginAttempt(wrk, entry, now, out, 0)];
+            _ = core.timers.remove(index);
+            core.statistics.connections +|= 1;
+            return out[0..beginAttempt(core, entry, now, out, 0)];
         }
 
         /// The first phase of generation retirement: account the attempt, then ask the engine to
         /// close the transport. The attempt's quota stays spent, so a reconnect only claims what the
         /// run has left instead of handing the failed attempt back.
-        pub fn onTransportFailure(wrk: *worker.Worker, index: u32, now: u64, out: []Step) []const Step {
-            if (index >= wrk.sessions.len) {
-                wrk.markFatal();
+        pub fn onTransportFailure(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
+            if (index >= core.sessions.len) {
+                core.markFatal();
                 return out[0..0];
             }
-            const entry = &wrk.sessions[index];
+            const entry = &core.sessions[index];
             if (entry.state == .closing or entry.state == .done) return out[0..0];
-            return out[0..fail(wrk, entry, now, out, 0)];
+            return out[0..fail(core, entry, now, out, 0)];
         }
 
         /// Settles one completed attempt. A verified attempt counts its bytes and its echoes; a
         /// corrupted one counts the same units as corrupted and none as bytes. The latency sample is
         /// the whole attempt, which is one batch.
-        pub fn onAttemptSettled(wrk: *worker.Worker, index: u32, now: u64, corrupt: bool, out: []Step) []const Step {
-            if (index >= wrk.sessions.len) {
-                wrk.markFatal();
+        pub fn onAttemptSettled(core: *worker.Core, index: u32, now: u64, corrupt: bool, out: []Step) []const Step {
+            if (index >= core.sessions.len) {
+                core.markFatal();
                 return out[0..0];
             }
-            const entry = &wrk.sessions[index];
+            const entry = &core.sessions[index];
             if (entry.state == .closing or entry.state == .done) return out[0..0];
             if (corrupt) {
-                wrk.statistics.corrupted +|= entry.requested_echoes;
+                core.statistics.corrupted +|= entry.requested_echoes;
             } else {
-                wrk.statistics.echoes +|= entry.requested_echoes;
-                wrk.statistics.bytes +|= entry.attempt_bytes;
+                core.statistics.echoes +|= entry.requested_echoes;
+                core.statistics.bytes +|= entry.attempt_bytes;
             }
             entry.settled +|= entry.requested_echoes;
             entry.attempt_accounted = true;
-            _ = wrk.timers.remove(index);
-            wrk.recordLatency(now -| entry.attempt_started_ticks);
-            if (wrk.interval_ticks != 0) {
+            _ = core.timers.remove(index);
+            core.recordLatency(now -| entry.attempt_started_ticks);
+            if (core.interval_ticks != 0) {
                 entry.state = .pacing;
-                entry.send_at_ticks = now +| wrk.interval_ticks;
-                wrk.armTimer(index, entry.send_at_ticks);
+                entry.send_at_ticks = now +| core.interval_ticks;
+                core.armTimer(index, entry.send_at_ticks);
                 return out[0..0];
             }
-            return out[0..beginAttempt(wrk, entry, now, out, 0)];
+            return out[0..beginAttempt(core, entry, now, out, 0)];
         }
 
         /// The second phase: the transport proved that every operation of this generation has been
@@ -324,66 +324,66 @@ pub const session = struct {
         /// The drain itself is not decided here. Whether the provider still owns an operation is a
         /// question about the native slot, and engine.zig answers it before emitting this event; the
         /// business machine is handed the verdict and never inspects native state.
-        pub fn onGenerationDrained(wrk: *worker.Worker, index: u32, now: u64, out: []Step) []const Step {
-            if (index >= wrk.sessions.len) {
-                wrk.markFatal();
+        pub fn onGenerationDrained(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
+            if (index >= core.sessions.len) {
+                core.markFatal();
                 return out[0..0];
             }
-            const entry = &wrk.sessions[index];
-            _ = wrk.timers.remove(index);
-            if (entry.reconnect_after_close and !wrk.stopping) {
+            const entry = &core.sessions[index];
+            _ = core.timers.remove(index);
+            if (entry.reconnect_after_close and !core.stopping) {
                 entry.state = .reconnecting;
-                entry.reconnect_at_ticks = now +| wrk.reconnect_ticks;
-                wrk.armTimer(index, entry.reconnect_at_ticks);
+                entry.reconnect_at_ticks = now +| core.reconnect_ticks;
+                core.armTimer(index, entry.reconnect_at_ticks);
                 return out[0..0];
             }
-            markDone(wrk, entry);
+            markDone(core, entry);
             return out[0..0];
         }
 
         /// A controlled stop leaves every unfinished attempt claimed but unsettled: those units are
         /// reported as cancelled by the run, not as losses.
-        pub fn beginShutdown(wrk: *worker.Worker) void {
-            if (wrk.stopping) return;
-            wrk.stopping = true;
-            for (wrk.sessions) |*entry| {
+        pub fn beginShutdown(core: *worker.Core) void {
+            if (core.stopping) return;
+            core.stopping = true;
+            for (core.sessions) |*entry| {
                 if (entry.state == .done) continue;
-                _ = wrk.timers.remove(entry.index);
+                _ = core.timers.remove(entry.index);
                 entry.reconnect_after_close = false;
                 entry.state = .closing;
             }
         }
 
-        pub fn allFinished(wrk: *const worker.Worker) bool {
-            for (wrk.sessions) |entry| {
+        pub fn allFinished(core: *const worker.Core) bool {
+            for (core.sessions) |entry| {
                 if (!entry.isFinished()) return false;
             }
             return true;
         }
 
-        pub fn waitTicks(wrk: *const worker.Worker, now: u64, maximum: u64) u64 {
-            return wrk.timers.waitTicks(now, maximum);
+        pub fn waitTicks(core: *const worker.Core, now: u64, maximum: u64) u64 {
+            return core.timers.waitTicks(now, maximum);
         }
 
         /// One attempt is one receive plus one send whatever the pipeline depth is. The quota is
         /// claimed per session, and a batch that would exceed the remaining quota is trimmed rather
         /// than refused, which is what makes the last batch of a run exact.
-        fn beginAttempt(wrk: *worker.Worker, entry: *Session, now: u64, out: []Step, base: usize) usize {
-            _ = wrk.timers.remove(entry.index);
-            const requested = wrk.options.batchCapacity();
-            const granted = claimSessionAttempts(&entry.claimed, wrk.options.echo_count, requested);
+        fn beginAttempt(core: *worker.Core, entry: *Session, now: u64, out: []Step, base: usize) usize {
+            _ = core.timers.remove(entry.index);
+            const requested = core.options.batchCapacity();
+            const granted = claimSessionAttempts(&entry.claimed, core.options.echo_count, requested);
             if (granted == 0) {
                 // The quota is exhausted. The generation is retired rather than left open: the peer
                 // must see the connection close as soon as this session has nothing left to echo,
                 // and a slot that keeps a live socket would starve the sessions behind it.
                 entry.reconnect_after_close = false;
                 entry.state = .closing;
-                armClose(wrk, entry, now);
-                return wrk.emit(out, base, .{ .close = entry.index });
+                armClose(core, entry, now);
+                return core.emit(out, base, .{ .close = entry.index });
             }
-            const attempt_bytes = wrk.payload_bytes * @as(usize, @intCast(granted));
+            const attempt_bytes = core.payload_bytes * @as(usize, @intCast(granted));
             if (attempt_bytes == 0 or attempt_bytes > std.math.maxInt(u32)) {
-                wrk.markFatal();
+                core.markFatal();
                 return 0;
             }
             entry.requested_echoes = granted;
@@ -397,12 +397,12 @@ pub const session = struct {
             entry.active_counted = true;
             entry.send_at_ticks = 0;
             entry.attempt_started_ticks = now;
-            wrk.statistics.attempted +|= granted;
-            entry.deadline_ticks = now +| wrk.timeout_ticks;
-            wrk.armTimer(entry.index, entry.deadline_ticks);
+            core.statistics.attempted +|= granted;
+            entry.deadline_ticks = now +| core.timeout_ticks;
+            core.armTimer(entry.index, entry.deadline_ticks);
             const length: u32 = @intCast(attempt_bytes);
-            var count = wrk.emit(out, base, .{ .receive = .{ .index = entry.index, .bytes = length } });
-            count += wrk.emit(out, base + count, .{ .send = .{ .index = entry.index, .bytes = length } });
+            var count = core.emit(out, base, .{ .receive = .{ .index = entry.index, .bytes = length } });
+            count += core.emit(out, base + count, .{ .send = .{ .index = entry.index, .bytes = length } });
             return count;
         }
 
@@ -411,32 +411,32 @@ pub const session = struct {
         ///
         /// A reconnect is counted here, at the failure that triggers it, so a stop that arrives while
         /// the session is waiting to reconnect cannot change the tally.
-        fn fail(wrk: *worker.Worker, entry: *Session, now: u64, out: []Step, base: usize) usize {
+        fn fail(core: *worker.Core, entry: *Session, now: u64, out: []Step, base: usize) usize {
             if (!entry.attempt_accounted) {
-                wrk.statistics.lost +|= entry.requested_echoes;
+                core.statistics.lost +|= entry.requested_echoes;
                 entry.settled +|= entry.requested_echoes;
                 entry.attempt_accounted = true;
             }
-            wrk.statistics.network_errors +|= 1;
-            const will_reconnect = wrk.reconnect_enabled and !wrk.stopping;
-            if (will_reconnect) wrk.statistics.reconnects +|= 1;
+            core.statistics.network_errors +|= 1;
+            const will_reconnect = core.reconnect_enabled and !core.stopping;
+            if (will_reconnect) core.statistics.reconnects +|= 1;
             entry.reconnect_after_close = will_reconnect;
             entry.state = .closing;
-            armClose(wrk, entry, now);
-            return wrk.emit(out, base, .{ .close = entry.index });
+            armClose(core, entry, now);
+            return core.emit(out, base, .{ .close = entry.index });
         }
 
         /// Every closing generation keeps a deadline: the drain is normally immediate, but a
         /// provider that never reports the last completion has to end the run rather than hang it.
-        fn armClose(wrk: *worker.Worker, entry: *Session, now: u64) void {
-            entry.deadline_ticks = now +| wrk.drain_grace_ticks;
-            wrk.armTimer(entry.index, entry.deadline_ticks);
+        fn armClose(core: *worker.Core, entry: *Session, now: u64) void {
+            entry.deadline_ticks = now +| core.drain_grace_ticks;
+            core.armTimer(entry.index, entry.deadline_ticks);
         }
 
         /// A session that cannot make progress any more is terminal: it leaves the active set, its
         /// timer is disarmed, and its socket has already been released by the close step.
-        fn markDone(wrk: *worker.Worker, entry: *Session) void {
-            _ = wrk.timers.remove(entry.index);
+        fn markDone(core: *worker.Core, entry: *Session) void {
+            _ = core.timers.remove(entry.index);
             entry.active_counted = false;
             entry.deadline_ticks = 0;
             entry.send_at_ticks = 0;
@@ -543,7 +543,11 @@ pub const worker = struct {
     ///
     /// Keeping the native owners in this record is what lets every other module treat a worker as
     /// plain data with no runtime dispatch; only engine.zig dereferences the native fields.
-    pub const Worker = struct {
+    /// The pure half of a worker: the business machine, its timers, its ledger and its lifecycle.
+    ///
+    /// It owns no native object, so a scheduler decision -- and every test of one -- needs no
+    /// completion port in the room.
+    pub const Core = struct {
         index: u32 = 0,
         session_count: u32 = 0,
         options: *const types.Options = undefined,
@@ -561,9 +565,6 @@ pub const worker = struct {
         bench_histogram: metrics.WorkerHistogram = if (metrics.benchmark_enabled) metrics.Histogram{} else {},
 
         sessions: []session.Session = &.{},
-        /// The native state of each session's current generation. The business machine above never
-        /// reaches into it; engine.zig owns every field.
-        slots: []native.transport.Slot = &.{},
         /// The step scratch buffer, split into fixed regions. A scheduler decision runs in one
         /// region, so a step produced while another is being executed can never overwrite the step
         /// being executed.
@@ -579,35 +580,23 @@ pub const worker = struct {
 
         phase: Phase = .starting,
         stopping: bool = false,
-        notification_arms: u64 = 0,
-        notification_deliveries: u64 = 0,
-        timeout_wakeups_while_outstanding: u64 = 0,
 
-        // Native ownership.
-        port: native.handle.Handle = .{},
-        thread: native.handle.Handle = .{},
-        completion_queue: native.rio.CompletionQueue = .{},
-        arena: native.arena.Arena = .{},
-        api: ?*const native.rio.Api = null,
-        connect_ex: ?c.LPFN_CONNECTEX = null,
-        remote_address: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN),
-        notification_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
 
-        pub fn markFatal(self: *Worker) void {
+        pub fn markFatal(self: *Core) void {
             self.statistics.fatal = true;
         }
 
-        pub fn armTimer(self: *Worker, index: u32, deadline: u64) void {
+        pub fn armTimer(self: *Core, index: u32, deadline: u64) void {
             if (!self.timers.insertOrUpdate(index, deadline)) self.markFatal();
         }
 
-        pub fn disarmTimer(self: *Worker, index: u32) void {
+        pub fn disarmTimer(self: *Core, index: u32) void {
             _ = self.timers.remove(index);
         }
 
         /// Three steps per session at most: a connect, a receive and a send. Emitting past the fixed
         /// scratch buffer is an internal invariant failure, not a capacity a caller may exceed.
-        pub fn emit(self: *Worker, out: []session.scheduler.Step, position: usize, step: session.scheduler.Step) usize {
+        pub fn emit(self: *Core, out: []session.scheduler.Step, position: usize, step: session.scheduler.Step) usize {
             if (position >= out.len) {
                 self.markFatal();
                 return 0;
@@ -620,7 +609,7 @@ pub const worker = struct {
         /// Takes the next step region. Running out of levels means the decision recursion is deeper
         /// than the design allows, which is an internal invariant failure rather than a capacity a
         /// caller may exceed.
-        pub fn acquireRegion(self: *Worker) []session.scheduler.Step {
+        pub fn acquireRegion(self: *Core) []session.scheduler.Step {
             const stride = stepRegionBytes(self.session_count);
             if (stride == 0 or self.step_depth >= step_levels) {
                 self.markFatal();
@@ -635,7 +624,7 @@ pub const worker = struct {
             return self.steps[start .. start + stride];
         }
 
-        pub fn releaseRegion(self: *Worker) void {
+        pub fn releaseRegion(self: *Core) void {
             if (self.step_depth == 0) {
                 self.markFatal();
                 return;
@@ -643,7 +632,7 @@ pub const worker = struct {
             self.step_depth -= 1;
         }
 
-        pub fn liveSessions(self: *const Worker) u32 {
+        pub fn liveSessions(self: *const Core) u32 {
             var count: u32 = 0;
             for (self.sessions) |entry| {
                 if (!entry.isFinished()) count += 1;
@@ -651,7 +640,7 @@ pub const worker = struct {
             return count;
         }
 
-        pub fn activeSessions(self: *const Worker) u32 {
+        pub fn activeSessions(self: *const Core) u32 {
             var count: u32 = 0;
             for (self.sessions) |entry| {
                 if (entry.active_counted) count += 1;
@@ -660,7 +649,7 @@ pub const worker = struct {
         }
 
         /// Publishes the ledger into the shared snapshot. A forced publish is the terminal one.
-        pub fn publish(self: *Worker, now: u64, force: bool) void {
+        pub fn publish(self: *Core, now: u64, force: bool) void {
             const snapshot = self.progress orelse return;
             if (!force and now < self.next_progress_ticks) return;
             const active = self.activeSessions();
@@ -668,7 +657,7 @@ pub const worker = struct {
             self.next_progress_ticks = now +| self.progress_interval_ticks;
         }
 
-        pub fn recordLatency(self: *Worker, ticks: u64) void {
+        pub fn recordLatency(self: *Core, ticks: u64) void {
             const micros: u64 = if (self.clock.frequency == 0)
                 1
             else
@@ -677,32 +666,69 @@ pub const worker = struct {
             if (metrics.benchmark_enabled) self.bench_histogram.record(micros);
         }
 
-        pub fn elapsedMilliseconds(self: *const Worker, now: u64, started: u64) u64 {
+        pub fn elapsedMilliseconds(self: *const Core, now: u64, started: u64) u64 {
             if (now <= started) return 0;
             return self.clock.ticksToMilliseconds(now - started);
         }
+
+    };
+
+    /// The native half of a worker: every object the kernel owns on its behalf, and the ownership
+    /// bookkeeping that decides when those objects may be released.
+    pub const RioTransport = struct {
+        /// The native state of each session's current generation. The business machine never reaches
+        /// into it; engine.zig owns every field.
+        slots: []native.transport.Slot = &.{},
+
+        port: native.handle.Handle = .{},
+        completion_queue: native.rio.CompletionQueue = .{},
+        arena: native.arena.Arena = .{},
+        api: ?*const native.rio.Api = null,
+        connect_ex: ?c.LPFN_CONNECTEX = null,
+        remote_address: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN),
+        notification_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
+
+        notification_arms: u64 = 0,
+        notification_deliveries: u64 = 0,
+        timeout_wakeups_while_outstanding: u64 = 0,
+
+        /// Operations the provider still owns across every session.
+        pub fn outstanding(self: *const RioTransport) u32 {
+            var count: u32 = 0;
+            for (self.slots) |slot| count += slot.outstanding();
+            return count;
+        }
+    };
+
+    /// The runtime that holds both halves and is the only place they meet: it drives the loop, turns
+    /// raw completions into events for the business machine, and executes the actions it returns.
+    pub const Worker = struct {
+        core: Core = .{},
+        transport: RioTransport = .{},
+        /// The worker's own thread, which is runtime lifecycle rather than transport ownership.
+        thread: native.handle.Handle = .{},
 
         /// The release order the design fixes: retire outstanding operations, close the completion
         /// queue and its notification state, deregister every buffer, release the single virtual
         /// allocation, free the host-side arrays, and only then close the completion port.
         pub fn release(self: *Worker, allocator: std.mem.Allocator) void {
-            for (self.slots) |*slot| slot.close();
-            self.completion_queue.deinit();
-            self.arena.deinit();
-            if (self.sessions.len != 0) allocator.free(self.sessions);
-            if (self.slots.len != 0) allocator.free(self.slots);
-            if (self.steps.len != 0) allocator.free(self.steps);
-            if (self.timer_nodes.len != 0) allocator.free(self.timer_nodes);
-            if (self.timer_positions.len != 0) allocator.free(self.timer_positions);
-            self.sessions = &.{};
-            self.slots = &.{};
-            self.steps = &.{};
-            self.timer_nodes = &.{};
-            self.timer_positions = &.{};
-            self.timers = .{};
-            self.port.deinit();
+            for (self.transport.slots) |*slot| slot.close();
+            self.transport.completion_queue.deinit();
+            self.transport.arena.deinit();
+            if (self.core.sessions.len != 0) allocator.free(self.core.sessions);
+            if (self.transport.slots.len != 0) allocator.free(self.transport.slots);
+            if (self.core.steps.len != 0) allocator.free(self.core.steps);
+            if (self.core.timer_nodes.len != 0) allocator.free(self.core.timer_nodes);
+            if (self.core.timer_positions.len != 0) allocator.free(self.core.timer_positions);
+            self.core.sessions = &.{};
+            self.transport.slots = &.{};
+            self.core.steps = &.{};
+            self.core.timer_nodes = &.{};
+            self.core.timer_positions = &.{};
+            self.core.timers = .{};
+            self.transport.port.deinit();
             self.thread.deinit();
-            self.phase = .stopped;
+            self.core.phase = .stopped;
         }
     };
 };
