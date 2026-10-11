@@ -796,6 +796,10 @@ pub const rio = struct {
 /// The 64-bit request context is self-contained: operation, session index, send slot and transport
 /// generation are encoded directly, so no pointer-valued side table is needed. A generation
 /// mismatch is a stale completion and never steers the live state machine.
+///
+/// This is the Completion layer, not the Transport layer: it owns no kernel object -- no request
+/// queue, no completion queue, no OVERLAPPED, no socket -- and it is one of the four data kinds the
+/// methodology lets the pure engine consume. The scheduler depends on it by design.
 pub const completion = struct {
     pub const Operation = enum(u8) {
         connect = 1,
