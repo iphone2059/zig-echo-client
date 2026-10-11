@@ -1,392 +1,417 @@
+//! Client engine tests: completion arbitration, generation retirement, registered-memory geometry,
+//! the timer heap against a reference model, and the exact Windows ABI.
+
 const std = @import("std");
 const client = @import("client");
-const win32 = client.win32;
-const rio = client.rio;
-const c = win32.c;
-const internal = client.engine_internal;
-const timer = client.timer_heap;
+const native = client.native;
+const metrics = client.metrics;
+const c = native.sdk.c;
 const engine = client.engine;
-const session_machine = client.client_session;
-const worker_machine = client.client_worker;
+const timer = client.timer;
+const scheduler = client.scheduler;
+const Session = client.session.Session;
+const Worker = client.worker.Worker;
 
-var notification_trace: [2]u8 = @splat(0);
+fn testClock() native.clock.Clock {
+    return native.clock.Clock.init() orelse @panic("QueryPerformanceFrequency failed");
+}
+
+/// Builds a worker record that owns only host memory, so a state-machine test never touches a
+/// registered buffer or a completion port it did not create.
+fn buildWorker(
+    sessions: []Session,
+    steps: []scheduler.Step,
+    nodes: []timer.Node,
+    positions: []u32,
+    options: *const client.types.Options,
+    payload_bytes: usize,
+) Worker {
+    var worker: Worker = .{};
+    worker.options = options;
+    worker.payload_bytes = payload_bytes;
+    worker.session_count = @intCast(sessions.len);
+    worker.sessions = sessions;
+    worker.steps = steps;
+    worker.timer_nodes = nodes;
+    worker.timer_positions = positions;
+    worker.timers = timer.Heap.init(nodes, positions) catch @panic("timer heap capacity");
+    worker.clock = testClock();
+    worker.timeout_ticks = worker.clock.millisecondsToTicks(5_000);
+    for (sessions, 0..) |*entry, index| {
+        entry.* = .{};
+        entry.index = @intCast(index);
+        entry.generation = 1;
+    }
+    return worker;
+}
+
+var notification_trace: [8]u8 = @splat(0);
 var notification_trace_len: usize = 0;
+
 fn fakeDequeue(_: c.RIO_CQ, _: [*c]c.RIORESULT, _: c.ULONG) callconv(.winapi) c.ULONG {
     notification_trace[notification_trace_len] = 'D';
     notification_trace_len += 1;
     return 0;
 }
+
 fn fakeNotify(_: c.RIO_CQ) callconv(.winapi) c_int {
     notification_trace[notification_trace_len] = 'N';
     notification_trace_len += 1;
     return c.ERROR_SUCCESS;
 }
 
-test "client RIO notification drains its CQ before one rearm" {
-    var api: rio.Api = .{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) };
+test "client RIO notification drains its queue before one rearm" {
+    var api = native.rio.Api{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) };
     api.table.RIODequeueCompletion = fakeDequeue;
     api.table.RIONotify = fakeNotify;
-    var worker: internal.Worker = .{};
-    worker.rio_api = &api;
-    worker.notification_armed = true;
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{};
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 1);
+    worker.api = &api;
+    worker.completion_queue = .{ .api = &api, .value = @as(c.RIO_CQ, @ptrFromInt(0x1000)), .armed = false };
+    sessions[0].receive_outstanding = 1;
     notification_trace_len = 0;
-    worker_machine.completeNotification(&worker);
-    try std.testing.expectEqualStrings("DN", notification_trace[0..notification_trace_len]);
-    try std.testing.expect(worker.notification_armed);
+    // The queue is only armed while work is in flight.
+    engine.maybeArm(&worker);
+    try std.testing.expect(worker.completion_queue.armed);
+    // A second arm while one is already outstanding is an internal contradiction, so the helper
+    // must not emit another notification.
+    engine.maybeArm(&worker);
+    // A delivery clears the armed state, then the queue is drained, then it is armed again.
+    engine.requireNotificationDelivered(&worker.completion_queue.armed);
+    engine.drainRio(.tcp, &worker, 4);
+    engine.maybeArm(&worker);
+    try std.testing.expectEqualStrings("NDN", notification_trace[0..notification_trace_len]);
+    try std.testing.expect(worker.completion_queue.armed);
+    // With nothing outstanding the queue stays unarmed, which is what keeps a notification from
+    // outliving the work it describes.
+    sessions[0].receive_outstanding = 0;
+    engine.requireNotificationDelivered(&worker.completion_queue.armed);
+    engine.maybeArm(&worker);
+    try std.testing.expectEqualStrings("NDN", notification_trace[0..notification_trace_len]);
+    try std.testing.expect(!worker.completion_queue.armed);
 }
 
-fn claimBatches(metrics: *internal.Metrics, counts: *[9]u32) void {
-    while (true) {
-        const granted = client.contract.claimAttempts(&metrics.claimed, 17, 8);
-        if (granted == 0) return;
-        counts[@intCast(granted)] += 1;
-    }
+test "client per-session quota trims the last batch to the remaining grant" {
+    var sessions: [2]Session = .{ .{}, .{} };
+    var steps: [6]scheduler.Step = undefined;
+    var nodes: [2]timer.Node = undefined;
+    var positions: [2]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .echo_count = 17, .pipeline_depth = 8, .session_count = 2 };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 4_096);
+    const started = worker.clock.nowTicks();
+    const connects = scheduler.start(&worker, started, &steps);
+    try std.testing.expectEqual(@as(usize, 2), connects.len);
+    // The first attempt of a generation is immediate and takes a whole pipeline batch.
+    const first = scheduler.onConnected(&worker, 0, started, &steps);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqual(@as(u64, 8), sessions[0].requested_echoes);
+    // A settled attempt starts the next one; the last batch is trimmed, never refused.
+    _ = scheduler.onAttemptSettled(&worker, 0, started, false, &steps);
+    try std.testing.expectEqual(@as(u64, 8), sessions[0].requested_echoes);
+    _ = scheduler.onAttemptSettled(&worker, 0, started, false, &steps);
+    try std.testing.expectEqual(@as(u64, 1), sessions[0].requested_echoes);
+    try std.testing.expectEqual(@as(u64, 17), worker.statistics.attempted);
+    try std.testing.expectEqual(@as(u64, 16), sessions[0].settled);
+    const exhausted = scheduler.onAttemptSettled(&worker, 0, started, false, &steps);
+    // The quota is spent, so the generation is retired instead of being left open: a session with
+    // nothing left to echo must not hold a socket the peer can never close.
+    try std.testing.expectEqual(@as(usize, 1), exhausted.len);
+    try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
+    _ = scheduler.onGenerationDrained(&worker, 0, started, &steps);
+    try std.testing.expectEqual(client.session.State.done, sessions[0].state);
+    // The quota switch is per session, so the second session's ledger is untouched.
+    try std.testing.expectEqual(@as(u64, 0), sessions[1].claimed);
+    try std.testing.expectEqual(@as(u64, 17), worker.statistics.attempted);
 }
 
-test "two client workers claim exactly 17 echoes in 8 8 1 batches" {
-    var metrics: internal.Metrics = .{};
-    var first_counts: [9]u32 = @splat(0);
-    var second_counts: [9]u32 = @splat(0);
-    const first = try std.Thread.spawn(.{}, claimBatches, .{ &metrics, &first_counts });
-    const second = std.Thread.spawn(.{}, claimBatches, .{ &metrics, &second_counts }) catch |err| {
-        first.join();
-        return err;
-    };
-    first.join();
-    second.join();
-    try std.testing.expectEqual(@as(u64, 17), metrics.claimed.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 2), first_counts[8] + second_counts[8]);
-    try std.testing.expectEqual(@as(u32, 1), first_counts[1] + second_counts[1]);
-    for (2..8) |size| try std.testing.expectEqual(@as(u32, 0), first_counts[size] + second_counts[size]);
+test "client latency sample is one completed batch" {
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 4 };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    const started = worker.clock.nowTicks();
+    _ = scheduler.start(&worker, started, &steps);
+    _ = scheduler.onConnected(&worker, 0, started, &steps);
+    sessions[0].attempt_started_ticks = started -| worker.clock.millisecondsToTicks(2);
+    _ = scheduler.onAttemptSettled(&worker, 0, started, false, &steps);
+    try std.testing.expectEqual(@as(u64, 1), worker.statistics.latency_samples);
+    try std.testing.expect(worker.statistics.latency_samples == worker.statistics.sampleCount());
+    try std.testing.expectEqual(@as(u64, 4), worker.statistics.echoes);
+    try std.testing.expectEqual(@as(u64, 64), worker.statistics.bytes);
 }
 
-test "client worker staged capacity failure rolls back unpublished ownership" {
-    const options: client.types.Options = .{ .cq_capacity = 0 };
-    const extensions: rio.Extensions = .{ .rio = .{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) }, .connect_ex = null };
-    const remote: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
-    const pattern = [_]u8{0x41};
-    var metrics: internal.Metrics = .{};
-    var stop = std.atomic.Value(bool).init(false);
-    var fatal = std.atomic.Value(bool).init(false);
-    var owner: internal.WorkerResources = .{};
-    var worker: internal.Worker = .{};
-    try std.testing.expectError(error.Capacity, worker_machine.initializeWorker(&worker, &extensions, &options, &remote, &pattern, 1, &metrics, &stop, &fatal, 0, 1, 1024, &owner));
-    try std.testing.expect(worker.resources == null);
-    try std.testing.expect(owner.port.get() == null);
-    try std.testing.expect(owner.arena.ptr == null);
-    try std.testing.expect(!worker.ready);
-}
-
-test "client worker rolls back every acquired resource stage before publication" {
-    var winsock = try win32.Winsock.init();
+test "client partial RIOSend completion reposts only the unsent tail" {
+    var winsock = try native.winsock.Winsock.init();
     defer winsock.deinit();
-    const extensions = try rio.Extensions.load();
-    const options: client.types.Options = .{ .cq_capacity = 4096 };
+    const extensions = try native.rio.Extensions.load();
+    var api = extensions.rio;
+    api.table.RIOSend = recordingSend;
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 100);
+    worker.api = &api;
+    worker.arena = try native.arena.Arena.create(&extensions.rio, 1, 128);
+    defer worker.arena.deinit();
+    sessions[0].state = .active;
+    sessions[0].attempt_bytes = 100;
+    sessions[0].send_outstanding = 1;
+    sent_offset = 0;
+    sent_length = 0;
+    const context = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
+    engine.handleRioResult(.tcp, &worker, .{
+        .Status = 0,
+        .BytesTransferred = 40,
+        .SocketContext = null,
+        .RequestContext = context,
+    });
+    try std.testing.expectEqual(@as(usize, 40), sessions[0].send_offset);
+    // The remainder is re-posted from the same registered window, so the offset moves and the
+    // registration does not.
+    try std.testing.expectEqual(@as(u32, 40), sent_offset);
+    try std.testing.expectEqual(@as(u32, 60), sent_length);
+    try std.testing.expectEqual(@as(u32, 1), sessions[0].send_outstanding);
+    try std.testing.expectEqual(@as(u64, 40), worker.statistics.sent_bytes);
+}
+
+var sent_offset: u32 = 0;
+var sent_length: u32 = 0;
+
+fn recordingSend(_: c.RIO_RQ, buffers: [*c]c.RIO_BUF, count: c.ULONG, _: c.DWORD, _: ?*anyopaque) callconv(.winapi) c.BOOL {
+    if (count != 1) return c.FALSE;
+    sent_offset = buffers[0].Offset;
+    sent_length = buffers[0].Length;
+    return c.TRUE;
+}
+
+test "client close waits for both posted completions before the generation drains" {
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    sessions[0].state = .active;
+    sessions[0].requested_echoes = 8;
+    sessions[0].send_outstanding = 1;
+    sessions[0].receive_outstanding = 1;
+    const closing = scheduler.onTransportFailure(&worker, 0, &steps);
+    try std.testing.expectEqual(@as(usize, 1), closing.len);
+    try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
+    try std.testing.expectEqual(@as(u64, 8), worker.statistics.lost);
+    try std.testing.expectEqual(@as(u64, 1), worker.statistics.network_errors);
+    // Closing the socket starts cancellation; it does not end the lifetime of the pending I/O, so
+    // the generation may not be released until every completion has been dequeued.
+    const send_context = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
+    engine.handleRioResult(.tcp, &worker, .{
+        .Status = 0,
+        .BytesTransferred = 0,
+        .SocketContext = null,
+        .RequestContext = send_context,
+    });
+    try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
+    try std.testing.expectEqual(@as(u64, 8), worker.statistics.lost);
+    const receive_context = native.completion.encode(0, 1, native.completion.no_send_slot, .receive).?;
+    engine.handleRioResult(.tcp, &worker, .{
+        .Status = 0,
+        .BytesTransferred = 0,
+        .SocketContext = null,
+        .RequestContext = receive_context,
+    });
+    try std.testing.expectEqual(client.session.State.done, sessions[0].state);
+    try std.testing.expectEqual(@as(u32, 0), worker.outstanding());
+    // The failed attempt's quota is spent exactly once.
+    try std.testing.expectEqual(@as(u64, 8), worker.statistics.lost);
+}
+
+test "client stale generation completions never steer the live state machine" {
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    sessions[0].state = .active;
+    sessions[0].requested_echoes = 4;
+    sessions[0].send_outstanding = 1;
+    sessions[0].generation = 3;
+    // A completion whose generation was already retired is still retired from the ledger, but it
+    // must not resume the attempt.
+    const stale = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
+    engine.handleRioResult(.tcp, &worker, .{
+        .Status = 0,
+        .BytesTransferred = 16,
+        .SocketContext = null,
+        .RequestContext = stale,
+    });
+    try std.testing.expectEqual(@as(u32, 0), sessions[0].send_outstanding);
+    try std.testing.expect(sessions[0].state == .active);
+    try std.testing.expect(!sessions[0].send_done);
+    try std.testing.expectEqual(@as(u64, 0), worker.statistics.sent_bytes);
+}
+
+test "client worker rolls back every acquired stage before publication" {
+    var winsock = try native.winsock.Winsock.init();
+    defer winsock.deinit();
+    const extensions = try native.rio.Extensions.load();
+    const options = client.types.Options{ .protocol = .tcp, .cq_capacity = 4096 };
     const remote: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
     const pattern = [_]u8{0x41};
-    const cases = [_]struct { stage: worker_machine.TestInitStage, expected: anyerror }{
+    const clock = testClock();
+    const cases = [_]struct { stage: engine.InitStage, expected: anyerror }{
         .{ .stage = .port, .expected = error.Port },
         .{ .stage = .arena, .expected = error.Arena },
         .{ .stage = .sessions, .expected = error.Sessions },
         .{ .stage = .timer_nodes, .expected = error.TimerNodes },
         .{ .stage = .timer_positions, .expected = error.TimerPositions },
-        .{ .stage = .socket_owners, .expected = error.SocketOwners },
         .{ .stage = .timer_heap, .expected = error.TimerHeap },
-        .{ .stage = .registration, .expected = error.Registration },
         .{ .stage = .completion_queue, .expected = error.CompletionQueue },
     };
-    defer worker_machine.test_fail_stage = null;
+    defer engine.test_fail_stage = null;
     for (cases) |case| {
-        var metrics: internal.Metrics = .{};
-        var stop = std.atomic.Value(bool).init(false);
-        var fatal = std.atomic.Value(bool).init(false);
-        var owner: internal.WorkerResources = .{};
-        var worker: internal.Worker = .{};
-        worker_machine.test_fail_stage = case.stage;
-        try std.testing.expectError(case.expected, worker_machine.initializeWorker(&worker, &extensions, &options, &remote, &pattern, 1, &metrics, &stop, &fatal, 0, 1, 1024 * 1024, &owner));
-        try std.testing.expect(worker.resources == null);
-        try std.testing.expect(owner.port.get() == null);
-        try std.testing.expect(owner.arena.ptr == null);
-        try std.testing.expectEqual(@as(usize, 0), owner.sessions.len);
-        try std.testing.expectEqual(@as(usize, 0), owner.timer_nodes.len);
-        try std.testing.expectEqual(@as(usize, 0), owner.session_sockets.len);
-        try std.testing.expect(!worker.ready);
+        var worker: Worker = .{};
+        engine.test_fail_stage = case.stage;
+        try std.testing.expectError(case.expected, engine.initializeWorker(.tcp, &worker, &extensions, &options, &remote, &pattern, 1, 1, 1024 * 1024, 0, &clock, null));
+        // Every stage that had already been acquired has been released, so a failed worker owns
+        // nothing at all.
+        try std.testing.expect(worker.port.value == null);
+        try std.testing.expect(worker.arena.pages.pointer == null);
+        try std.testing.expectEqual(@as(usize, 0), worker.sessions.len);
+        try std.testing.expectEqual(@as(usize, 0), worker.steps.len);
+        try std.testing.expectEqual(@as(usize, 0), worker.timer_nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), worker.timer_positions.len);
+        try std.testing.expect(!worker.completion_queue.valid());
     }
 }
 
-var last_reposted_offset: u32 = 0;
-var last_reposted_length: u32 = 0;
-fn fakeSend(_: c.RIO_RQ, buffers: [*c]c.RIO_BUF, count: c.ULONG, _: c.DWORD, _: ?*anyopaque) callconv(.winapi) c.BOOL {
-    if (count != 1) return c.FALSE;
-    last_reposted_offset = buffers[0].Offset;
-    last_reposted_length = buffers[0].Length;
-    return c.TRUE;
-}
-
-test "client partial RIOSend completion reposts only the unsent tail" {
-    var api: rio.Api = .{ .table = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE) };
-    api.table.RIOSend = fakeSend;
-    var worker: internal.Worker = .{};
-    var sessions: [1]internal.Session = .{.{}};
-    worker.rio_api = &api;
-    worker.sessions = &sessions;
-    worker.session_count = 1;
-    worker.maximum_attempt_bytes = 100;
-    sessions[0].owner = &worker;
-    sessions[0].state = .active;
-    sessions[0].attempt_bytes = 100;
-    sessions[0].outstanding = 2;
-    sessions[0].send_request.session = &sessions[0];
-    sessions[0].send_request.operation = .send;
-    session_machine.processRioResult(&worker, .{
-        .Status = c.ERROR_SUCCESS,
-        .BytesTransferred = 40,
-        .SocketContext = null,
-        .RequestContext = @ptrCast(&sessions[0].send_request),
-    });
-    try std.testing.expectEqual(@as(usize, 40), sessions[0].send_offset);
-    try std.testing.expectEqual(@as(u32, 40), last_reposted_offset);
-    try std.testing.expectEqual(@as(u32, 60), last_reposted_length);
-    try std.testing.expectEqual(@as(u32, 2), sessions[0].outstanding);
-}
-
-test "client 17 logical echoes at pipeline 8 claim batches of 8 8 and 1" {
-    var claimed = std.atomic.Value(u64).init(0);
-    const first = client.contract.claimAttempts(&claimed, 17, 8);
-    const second = client.contract.claimAttempts(&claimed, 17, 8);
-    const third = client.contract.claimAttempts(&claimed, 17, 8);
-    try std.testing.expectEqual(@as(u64, 8), first);
-    try std.testing.expectEqual(@as(u64, 8), second);
-    try std.testing.expectEqual(@as(u64, 1), third);
-    try std.testing.expectEqual(@as(u64, 0), client.contract.claimAttempts(&claimed, 17, 8));
-    try std.testing.expectEqual(@as(u64, 17 * 4096), (first + second + third) * 4096);
-}
-
-test "client close waits for both posted send and receive completions" {
+test "client release barrier requires every completion retired" {
+    var sessions: [1]Session = .{.{}};
+    var steps: [3]scheduler.Step = undefined;
     var nodes: [1]timer.Node = undefined;
     var positions: [1]u32 = undefined;
-    const heap = try timer.Heap.init(&nodes, &positions);
-    var sockets: [1]win32.Socket = .{.{}};
-    var owner: internal.WorkerResources = .{ .session_sockets = &sockets };
-    var worker: internal.Worker = .{};
-    var sessions: [1]internal.Session = .{.{}};
-    worker.resources = &owner;
-    worker.sessions = &sessions;
-    worker.session_count = 1;
-    worker.live_sessions = 1;
-    worker.timers = heap;
-    sessions[0].owner = &worker;
-    sessions[0].state = .active;
-    sessions[0].outstanding = 2;
-    sessions[0].send_request.session = &sessions[0];
-    sessions[0].receive_request.session = &sessions[0];
-    session_machine.closeAttempt(&sessions[0], false);
-    try std.testing.expectEqual(internal.SessionState.closing, sessions[0].state);
-    try std.testing.expectEqual(@as(u32, 2), sessions[0].outstanding);
-    const requests = [_]*internal.Request{ &sessions[0].send_request, &sessions[0].receive_request };
-    for (requests, 0..) |request, index| {
-        session_machine.processRioResult(&worker, .{
-            .Status = c.ERROR_SUCCESS,
-            .BytesTransferred = 0,
-            .SocketContext = null,
-            .RequestContext = @ptrCast(request),
-        });
-        try std.testing.expectEqual(if (index == 0) internal.SessionState.closing else .done, sessions[0].state);
+    const options = client.types.Options{ .protocol = .tcp };
+    var worker = buildWorker(&sessions, &steps, &nodes, &positions, &options, 16);
+    sessions[0].state = .done;
+    try std.testing.expectEqual(@as(u32, 0), worker.outstanding());
+    try std.testing.expect(sessions[0].isFinished());
+    // The named boundary itself is exercised by the fault driver, which must terminate the process.
+    sessions[0].receive_outstanding = 1;
+    try std.testing.expectEqual(@as(u32, 1), worker.outstanding());
+}
+
+test "client arena registers one send window per slot and one shared receive window" {
+    var winsock = try native.winsock.Winsock.init();
+    defer winsock.deinit();
+    const extensions = try native.rio.Extensions.load();
+    var arena = try native.arena.Arena.create(&extensions.rio, 4, 256);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(usize, 4), arena.send_registrations.len);
+    try std.testing.expect(arena.receive_registration.valid());
+    try std.testing.expectEqual(@as(usize, 4 * 256), arena.receive_offset);
+    try std.testing.expectEqual(@as(usize, 4 * 256 * 2), arena.bytes);
+    // The documented RIOSend contract forbids sharing any part of a registration with another
+    // pending send, so every TX window must own a distinct registration.
+    for (arena.send_registrations, 0..) |registration, index| {
+        try std.testing.expect(registration.valid());
+        for (arena.send_registrations[index + 1 ..]) |other| {
+            try std.testing.expect(registration.id != other.id);
+        }
+        try std.testing.expect(registration.id != arena.receive_registration.id);
     }
-    try std.testing.expectEqual(@as(u32, 0), worker.live_sessions);
+    // Views are bounds-checked against the slot stride instead of silently aliasing a neighbour.
+    try std.testing.expect(arena.receiveView(3, 256) != null);
+    try std.testing.expect(arena.receiveView(3, 257) == null);
+    try std.testing.expect(arena.receiveView(4, 16) == null);
+    try std.testing.expect(arena.sendViewFrom(0, 200, 56) != null);
+    try std.testing.expect(arena.sendViewFrom(0, 200, 57) == null);
+    try std.testing.expect(arena.sendBytes(0, 256) != null);
+    try std.testing.expect(arena.sendBytes(4, 256) == null);
 }
 
-test "client failed active attempt accounts claimed echoes once" {
-    var nodes: [1]timer.Node = undefined;
-    var positions: [1]u32 = undefined;
-    const heap = try timer.Heap.init(&nodes, &positions);
-    var sockets: [1]win32.Socket = .{.{}};
-    var owner: internal.WorkerResources = .{ .session_sockets = &sockets };
-    var metrics: internal.Metrics = .{};
-    metrics.claimed.store(8, .monotonic);
-    const options: client.types.Options = .{};
-    var worker: internal.Worker = .{};
-    var sessions: [1]internal.Session = .{.{}};
-    worker.resources = &owner;
-    worker.sessions = &sessions;
-    worker.session_count = 1;
-    worker.live_sessions = 1;
-    worker.timers = heap;
-    worker.options = &options;
-    worker.metrics = &metrics;
-    sessions[0].owner = &worker;
-    sessions[0].state = .active;
-    sessions[0].outstanding = 1;
-    sessions[0].requested_echoes = 8;
-    sessions[0].send_request.session = &sessions[0];
-    session_machine.connectionFailed(&sessions[0]);
-    try std.testing.expectEqual(internal.SessionState.closing, sessions[0].state);
-    try std.testing.expectEqual(@as(u64, 8), metrics.lost.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), metrics.network_errors.load(.monotonic));
-    try std.testing.expect(sessions[0].attempt_accounted);
-    session_machine.processRioResult(&worker, .{
-        .Status = c.ERROR_SUCCESS,
-        .BytesTransferred = 0,
-        .SocketContext = null,
-        .RequestContext = @ptrCast(&sessions[0].send_request),
-    });
-    try std.testing.expectEqual(internal.SessionState.done, sessions[0].state);
-    try std.testing.expectEqual(@as(u64, 8), metrics.lost.load(.monotonic));
-    try std.testing.expect(internal.sessionTerminalAccountingValid(8, 0, 0, metrics.lost.load(.monotonic)));
-}
-
-comptime {
-    if (@FieldType(internal.Worker, "resources") != ?*internal.WorkerResources)
-        @compileError("client worker resources must have a concrete owner type");
-    if (engine.WorkerResources != internal.WorkerResources)
-        @compileError("client engine compatibility alias must retain the concrete owner type");
-}
-
-test "client unpublished partly initialized owner releases acquired resources" {
-    var owner: internal.WorkerResources = .{};
-    owner.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
-    try std.testing.expect(owner.port.get() != null);
-    owner.arena = try win32.VirtualMemory.alloc(4096);
-    var worker: internal.Worker = .{};
-    worker.resources = &owner;
-    engine.destroyWorker(&worker);
-    try std.testing.expect(owner.port.get() == null);
-    try std.testing.expect(owner.arena.ptr == null);
-    try std.testing.expect(worker.resources == null);
-}
-
-test "client worker partition covers every session without empty workers" {
-    try std.testing.expectEqual(@as(u32, 2), engine.workerCount(2, 8));
-    try std.testing.expectEqual(@as(u32, 3), engine.partitionSessions(10, 3, 0));
-    try std.testing.expectEqual(@as(u32, 3), engine.partitionSessions(10, 3, 1));
-    try std.testing.expectEqual(@as(u32, 4), engine.partitionSessions(10, 3, 2));
-}
-
-test "client Win32 owners transfer reset and destroy exactly once" {
-    var socket: win32.Socket = .{};
-    try std.testing.expectEqual(c.INVALID_SOCKET, socket.get());
-    try std.testing.expectEqual(c.INVALID_SOCKET, socket.take());
-    socket.reset(c.INVALID_SOCKET);
-    socket.deinit();
-    var handle: win32.Handle = .{};
-    try std.testing.expect(handle.get() == null);
-    handle.reset(null);
-    handle.deinit();
-    var memory = try win32.VirtualMemory.alloc(4096);
-    const pointer = memory.take();
-    memory.reset(pointer);
+test "client native owners transfer reset and destroy exactly once" {
+    var sock: native.socket.Socket = .{};
+    try std.testing.expectEqual(c.INVALID_SOCKET, sock.get());
+    try std.testing.expectEqual(c.INVALID_SOCKET, sock.take());
+    sock.reset(c.INVALID_SOCKET);
+    sock.deinit();
+    var kernel: native.handle.Handle = .{};
+    try std.testing.expect(kernel.get() == null);
+    kernel.reset(null);
+    kernel.deinit();
+    var memory = try native.arena.VirtualMemory.alloc(4_096);
     memory.deinit();
     memory.deinit();
+    try std.testing.expect(memory.pointer == null);
 }
 
-test "client registered sockets require overlapped RIO and ABI is exact" {
-    try std.testing.expectEqual(c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO, win32.registeredSocketFlags());
+test "client registered sockets require overlapped RIO and the ABI is exact" {
+    try std.testing.expectEqual(c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO, native.socket.registeredFlags());
     try std.testing.expectEqual(@as(u32, 0x00000004), c.RIO_MSG_WAITALL);
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(c.RIO_BUF));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(c.RIORESULT));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(c.OVERLAPPED));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(c.RIO_NOTIFICATION_COMPLETION));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(c.RIO_EXTENSION_FUNCTION_TABLE));
 }
 
-test "client loads complete RIO table and ConnectEx" {
+test "client loads the complete RIO table and ConnectEx" {
     var empty: c.RIO_EXTENSION_FUNCTION_TABLE = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE);
-    try std.testing.expect(!rio.Api.tableComplete(&empty));
-    var winsock = try win32.Winsock.init();
+    try std.testing.expect(!native.rio.Api.tableComplete(&empty));
+    var winsock = try native.winsock.Winsock.init();
     defer winsock.deinit();
-    const extensions = try rio.Extensions.load();
-    try std.testing.expect(rio.Api.tableComplete(&extensions.rio.table));
+    const extensions = try native.rio.Extensions.load();
+    try std.testing.expect(native.rio.Api.tableComplete(&extensions.rio.table));
     try std.testing.expect(extensions.connect_ex != null);
 }
 
-test "client timer uses exact deadline and saturated DWORD wait" {
-    var nodes: [3]timer.Node = undefined;
-    var positions: [3]u32 = undefined;
-    var heap = try timer.Heap.init(&nodes, &positions);
-    try std.testing.expectEqual(c.INFINITE, heap.waitMilliseconds(5));
-    try std.testing.expect(heap.insertOrUpdate(2, 30));
-    try std.testing.expect(heap.insertOrUpdate(1, 30));
-    try std.testing.expectEqual(@as(u32, 25), heap.waitMilliseconds(5));
-    try std.testing.expectEqual(@as(?u32, 1), heap.popExpired(30));
-    try std.testing.expectEqual(@as(?u32, 2), heap.popExpired(30));
-    try std.testing.expect(heap.insertOrUpdate(0, std.math.maxInt(u64)));
-    try std.testing.expectEqual(c.INFINITE - 1, heap.waitMilliseconds(0));
-}
-
-test "client release barrier and terminal accounting require all completions" {
-    var state: internal.WorkerLifecycle = .{ .phase = .draining, .live_sessions = 0, .total_outstanding = 0, .notification_armed = false };
-    try std.testing.expect(!internal.workerMayRelease(&state));
-    state.phase = .stopped;
-    try std.testing.expect(internal.workerMayRelease(&state));
-    state.total_outstanding = 1;
-    try std.testing.expect(!internal.workerMayRelease(&state));
-    try std.testing.expect(internal.sessionTerminalAccountingValid(10, 8, 1, 1));
-    try std.testing.expect(!internal.sessionTerminalAccountingValid(10, 8, 1, 0));
-}
-
-test "client stable context and IOCP notification identities are exact" {
-    var worker: internal.Worker = .{};
-    var sessions: [2]internal.Session = .{ .{ .index = 0 }, .{ .index = 1 } };
-    sessions[0].owner = &worker;
-    sessions[0].receive_request.session = &sessions[0];
-    sessions[0].send_request.session = &sessions[0];
-    try std.testing.expect(internal.requestContextValid(&sessions[0].receive_request, &sessions, &worker));
-    try std.testing.expect(internal.requestContextValid(&sessions[0].send_request, &sessions, &worker));
-    var foreign: internal.Session = .{};
-    foreign.owner = &worker;
-    foreign.receive_request.session = &foreign;
-    try std.testing.expect(!internal.requestContextValid(&foreign.receive_request, &sessions, &worker));
-    var expected: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
-    var other: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
-    try std.testing.expect(internal.notificationPacketMatches(7, &expected, 7, &expected));
-    try std.testing.expect(!internal.notificationPacketMatches(7, &other, 7, &expected));
-}
-
-test "client closes idle CQ with an armed and already queued notification" {
-    var winsock = try win32.Winsock.init();
+test "client closes an idle completion queue that is armed with a queued notification" {
+    var winsock = try native.winsock.Winsock.init();
     defer winsock.deinit();
-    const api = try rio.Api.load();
-    var owner: engine.WorkerResources = .{};
-    defer owner.completion_queue.deinit();
-    defer owner.port.deinit();
-    owner.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
-    try std.testing.expect(owner.port.value != null);
-    var worker: internal.Worker = .{};
-    worker.resources = &owner;
-    worker.port = owner.port.value;
+    const api = try native.rio.Api.load();
+    var worker: Worker = .{};
+    defer worker.release(std.heap.page_allocator);
+    worker.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
+    try std.testing.expect(worker.port.value != null);
+    worker.api = &api;
     var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
     notification.Type = c.RIO_IOCP_COMPLETION;
-    notification.Iocp.IocpHandle = worker.port;
+    notification.Iocp.IocpHandle = worker.port.get();
     notification.Iocp.CompletionKey = @ptrCast(&worker);
     notification.Iocp.Overlapped = @ptrCast(&worker.notification_overlapped);
-    const cq = api.createCq(8, &notification);
-    try std.testing.expect(cq != c.RIO_INVALID_CQ);
-    owner.completion_queue.reset(&api, cq);
-    worker.completion_queue = cq;
-    try std.testing.expectEqual(@as(c_int, c.ERROR_SUCCESS), api.notify(cq));
-    worker.notification_armed = true;
-    try std.testing.expect(c.PostQueuedCompletionStatus(worker.port, 0, @intFromPtr(&worker), &worker.notification_overlapped) != c.FALSE);
-
+    worker.completion_queue.reset(&api, api.createCq(8, &notification));
+    try std.testing.expect(worker.completion_queue.valid());
+    try std.testing.expectEqual(@as(c_int, c.ERROR_SUCCESS), api.notify(worker.completion_queue.value));
+    worker.completion_queue.armed = true;
+    try std.testing.expect(c.PostQueuedCompletionStatus(worker.port.get(), 0, @intFromPtr(&worker), &worker.notification_overlapped) != c.FALSE);
     engine.retireCompletionQueue(&worker);
-
-    try std.testing.expectEqual(c.RIO_INVALID_CQ, worker.completion_queue);
-    try std.testing.expectEqual(c.RIO_INVALID_CQ, owner.completion_queue.value);
-    try std.testing.expect(!worker.notification_armed);
-    var transferred: c.DWORD = 0;
-    var key: usize = 0;
-    var overlapped: [*c]c.OVERLAPPED = null;
-    try std.testing.expect(c.GetQueuedCompletionStatus(worker.port, &transferred, &key, &overlapped, 0) != c.FALSE);
-    try std.testing.expectEqual(@intFromPtr(&worker), key);
-    try std.testing.expect(overlapped == &worker.notification_overlapped);
+    try std.testing.expectEqual(c.RIO_INVALID_CQ, worker.completion_queue.value);
+    try std.testing.expect(!worker.completion_queue.armed);
 }
 
-test "client atomic metrics count beyond 32 bits and percentile boundaries" {
-    var metrics: internal.Metrics = .{};
-    metrics.echoed.store(@as(u64, 1) << 40, .monotonic);
-    _ = metrics.echoed.fetchAdd(1, .monotonic);
-    try std.testing.expectEqual((@as(u64, 1) << 40) + 1, metrics.echoed.load(.monotonic));
-    metrics.latency_bins[10].store(4, .monotonic);
-    metrics.latency_bins[12].store(1, .monotonic);
-    try std.testing.expectEqual(@as(u64, 1024), internal.percentile(&metrics, 5, 50, 100));
-    try std.testing.expectEqual(@as(u64, 4096), internal.percentile(&metrics, 5, 99, 100));
+test "client request contexts round trip and reject forged values" {
+    const send = native.completion.encode(3, 7, native.completion.no_send_slot, .send) orelse return error.TestUnexpectedResult;
+    const decoded = native.completion.decode(@intFromPtr(send)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 3), decoded.index);
+    try std.testing.expectEqual(@as(u32, 7), decoded.generation);
+    try std.testing.expectEqual(native.completion.Operation.send, decoded.operation);
+    // A zero context, a bit above the canonical payload, and a receive carrying a send slot are all
+    // rejected rather than masked into a live request.
+    try std.testing.expect(native.completion.decode(0) == null);
+    try std.testing.expect(native.completion.decode(@as(usize, 1) << 47) == null);
+    try std.testing.expect(native.completion.encode(1, 1, 3, .receive) == null);
+    try std.testing.expect(native.completion.encode(1, 0, 0, .receive) == null);
+    // The generation wraps rather than saturating: it is only ever reused once the previous one has
+    // fully drained, so wrapping back to one cannot alias a live request.
+    try std.testing.expectEqual(@as(u32, 1), native.completion.nextGeneration(native.completion.maximum_generation));
+    try std.testing.expectEqual(@as(u32, 2), native.completion.nextGeneration(1));
 }
 
 fn xorshift(state: *u32) u32 {
@@ -444,5 +469,33 @@ test "client timer agrees with a fixed-seed 100000-operation reference model" {
             try std.testing.expectEqual(deadline, nodes[positions[candidate]].deadline);
         }
         try std.testing.expectEqual(count, heap.len);
+    }
+}
+
+test "client terminal line keeps the reference field order" {
+    var statistics = metrics.Statistics{};
+    statistics.attempted = 5;
+    statistics.echoes = 3;
+    statistics.elapsed_ms = 10;
+    var buffer: [1024]u8 = undefined;
+    const line = statistics.writeLine("final", 2, 1, &buffer) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, line, "final elapsed_ms=10 sessions=2 active=1 attempted=5 pending=2 echoed=3 corrupted=0 lost=0 cancelled=0 "));
+    try std.testing.expect(std.mem.indexOf(u8, line, "sent_bytes=0 received_bytes=0 bytes=0 connections=0 reconnects=0 network_errors=0 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "mean_us=0") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "latency_sample=batch\n"));
+}
+
+test "client worker resolution covers every session without empty workers" {
+    for (1..8) |workers| {
+        for (1..40) |sessions| {
+            const count: u32 = @intCast(sessions);
+            const resolved = client.contract.resolveWorkerCount(@intCast(workers), count);
+            try std.testing.expect(resolved >= 1 and resolved <= count);
+            const base = count / resolved;
+            const extra = count % resolved;
+            var total: u32 = 0;
+            for (0..resolved) |index| total += @intCast(base + @intFromBool(index < extra));
+            try std.testing.expectEqual(count, total);
+        }
     }
 }

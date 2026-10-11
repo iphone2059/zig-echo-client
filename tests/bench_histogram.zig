@@ -1,8 +1,8 @@
 const std = @import("std");
-const Histogram = @import("client").bench_histogram.Histogram;
+const Histogram = @import("client").metrics.Histogram;
 
 test "one microsecond and powers of two remain distinct" {
-    var histogram = Histogram.init();
+    var histogram = Histogram{};
     histogram.record(1);
     histogram.record(2);
     histogram.record(64);
@@ -13,7 +13,7 @@ test "one microsecond and powers of two remain distinct" {
 }
 
 test "nearby values in a power-of-two band use distinct sub-buckets" {
-    var histogram = Histogram.init();
+    var histogram = Histogram{};
     histogram.record(64);
     histogram.record(65);
     histogram.record(127);
@@ -25,7 +25,7 @@ test "nearby values in a power-of-two band use distinct sub-buckets" {
 }
 
 test "zero and saturated maximum are bounded" {
-    var histogram = Histogram.init();
+    var histogram = Histogram{};
     histogram.record(0);
     histogram.record(std.math.maxInt(u64));
     try std.testing.expectEqual(@as(u64, 1), histogram.percentile(1, 2));
@@ -33,7 +33,7 @@ test "zero and saturated maximum are bounded" {
 }
 
 test "percentile ranks use ceiling and one sample per completed batch" {
-    var histogram = Histogram.init();
+    var histogram = Histogram{};
     for (0..1000) |i| histogram.record(@intCast(i + 1));
     try std.testing.expectEqual(@as(u64, 1000), histogram.count);
     try std.testing.expect(histogram.percentile(50, 100) >= 490);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const client = @import("client");
-const c = client.sdk.c;
+const c = client.native.sdk.c;
 
 pub fn main() u8 {
     var buffer: [1024]u8 = undefined;
@@ -24,5 +24,5 @@ pub fn main() u8 {
         @sizeOf(c.RIO_EXTENSION_FUNCTION_TABLE), c.RIO_MSG_WAITALL,                        c.SO_UPDATE_CONNECT_CONTEXT,                      @offsetOf(c.SOCKADDR_IN, "sin_port"),
         @offsetOf(c.OVERLAPPED, "hEvent"),       @offsetOf(c.RIORESULT, "RequestContext"), @offsetOf(c.RIO_NOTIFICATION_COMPLETION, "Iocp"),
     }) catch return 4;
-    return if (client.win32.writeStdout(output)) 0 else 4;
+    return if (client.native.diagnostics.writeStdout(output)) 0 else 4;
 }
