@@ -711,3 +711,39 @@ test "a short TCP receive fails the attempt" {
     try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.received_bytes);
     try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.echoes);
 }
+test "the reconnect wait begins only after the generation has drained" {
+    // Mirrors reconnect_wait_begins_only_after_generation_drained. A failure retires the generation
+    // but does not schedule the reconnect: a new socket may not exist while the old one can still
+    // produce completions, so the wait starts at the drain and not at the failure.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 1, .reconnect_seconds = 2 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    // The worker derives both from the options at initialisation; the test builds only the records.
+    worker.core.reconnect_enabled = true;
+    worker.core.reconnect_ticks = worker.core.clock.millisecondsToTicks(2_000);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    _ = scheduler.onConnected(&worker.core, 0, started, &steps);
+
+    const closing = scheduler.onTransportFailure(&worker.core, 0, started, &steps);
+    try std.testing.expectEqual(@as(usize, 1), countSteps(closing, .close));
+    try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
+    // Nothing is scheduled while the generation is still in flight.
+    try std.testing.expectEqual(@as(u64, 0), sessions[0].reconnect_at_ticks);
+
+    const drained = started +| worker.core.clock.millisecondsToTicks(200);
+    const after_drain = scheduler.onGenerationDrained(&worker.core, 0, drained, &steps);
+    try std.testing.expectEqual(@as(usize, 0), after_drain.len);
+    try std.testing.expectEqual(client.session.State.reconnecting, sessions[0].state);
+    try std.testing.expectEqual(drained +| worker.core.reconnect_ticks, sessions[0].reconnect_at_ticks);
+
+    // One tick short of the deadline is still a wait; the deadline itself opens the connection.
+    _ = scheduler.poll(&worker.core, sessions[0].reconnect_at_ticks -| 1, &steps);
+    try std.testing.expectEqual(client.session.State.reconnecting, sessions[0].state);
+    const due = scheduler.poll(&worker.core, sessions[0].reconnect_at_ticks, &steps);
+    try std.testing.expectEqual(@as(usize, 1), countSteps(due, .connect));
+}
