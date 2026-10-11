@@ -342,8 +342,18 @@ pub const session = struct {
             // The native request ended when its completion was dequeued, which is where the reference
             // clears the same flag.
             entry.receive_posted = false;
-            // Exact comparison: a short read is a failure, never a partial success. A short TCP read
-            // is already a connection failure by the time this runs; a short datagram is corrupted.
+            // A TCP receive that completed a strict prefix is a connection failure, never a partial
+            // success. A short datagram falls through instead, because UDP is message oriented and a
+            // short message is a corrupted echo rather than the first half of the next one.
+            //
+            // The rule and the byte accounting sit together on purpose: a read the protocol refuses is
+            // never counted as received bytes.
+            if (core.options.protocol == .tcp and echoed.len != expected.len) {
+                return onTransportFailure(core, index, now, out);
+            }
+            core.statistics.received_bytes +|= echoed.len;
+            // Exact comparison: by here the lengths agree for TCP, so a mismatch is a datagram whose
+            // echo does not match what was sent.
             entry.receive_corrupted = !payload.verify(echoed, expected);
             entry.receive_done = true;
             if (!attemptSettled(entry)) return out[0..0];

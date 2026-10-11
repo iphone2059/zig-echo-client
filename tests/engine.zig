@@ -675,8 +675,10 @@ test "a corrupted receive settles the batch once and continues the quota" {
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
     _ = scheduler.onSent(&worker.core, 0, started, &steps);
 
-    var echoed: [12]u8 = @splat(0xAB);
-    var expected: [6]u8 = @splat(0xAB);
+    // Corruption is a content mismatch, not a short read: the lengths agree with the attempt and the
+    // bytes differ, which is the case this reference sequence is about.
+    var echoed: [12]u8 = @splat(0xCD);
+    var expected: [12]u8 = @splat(0xAB);
     const next = scheduler.onReceived(&worker.core, 0, &echoed, &expected, started, &steps);
     // The next attempt is one whole batch, and the receive is posted before the send.
     try std.testing.expectEqual(@as(usize, 1), countSteps(next, .receive));
@@ -685,4 +687,27 @@ test "a corrupted receive settles the batch once and continues the quota" {
     try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.lost);
     try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.reconnects);
     try std.testing.expectEqual(client.session.State.active, sessions[0].state);
+}
+test "a short TCP receive fails the attempt" {
+    // Mirrors short_tcp_receive_fails_the_attempt. A TCP read that completed a strict prefix is a
+    // connection-level failure rather than a partial success, and it is refused before any received
+    // byte is counted.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 1 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    _ = scheduler.onConnected(&worker.core, 0, started, &steps);
+
+    var echoed: [3]u8 = @splat(0xAB);
+    var expected: [6]u8 = @splat(0xAB);
+    const refused = scheduler.onReceived(&worker.core, 0, &echoed, &expected, started, &steps);
+    try std.testing.expectEqual(@as(usize, 1), countSteps(refused, .close));
+    try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.lost);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.received_bytes);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.echoes);
 }

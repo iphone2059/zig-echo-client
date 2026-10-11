@@ -673,11 +673,9 @@ pub fn handleRioResult(comptime protocol: types.Protocol, wrk: *Worker, result: 
             completeSend(protocol, wrk, entry.index);
         },
         .receive => {
-            if (protocol == .tcp and result.BytesTransferred != entry.attempt_bytes) {
-                failSession(protocol, wrk, entry.index);
-                return;
-            }
-            wrk.core.statistics.received_bytes +|= result.BytesTransferred;
+            // Whether a short receive is a connection failure or a corrupted echo depends on the
+            // protocol, which is a business rule: onReceived decides it, together with the byte
+            // accounting that must not run for a read the protocol refused.
             entry.received_bytes = result.BytesTransferred;
             completeReceive(protocol, wrk, entry.index);
         },
