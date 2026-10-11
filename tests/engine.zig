@@ -747,3 +747,28 @@ test "the reconnect wait begins only after the generation has drained" {
     const due = scheduler.poll(&worker.core, sessions[0].reconnect_at_ticks, &steps);
     try std.testing.expectEqual(@as(usize, 1), countSteps(due, .connect));
 }
+test "a send failure after a receive loses the whole unsettled batch" {
+    // Mirrors send_failure_after_a_receive_loses_the_whole_unsettled_batch. Accounting waits for both
+    // native operations, so a receive that verified is not turned into an echo success by a send that
+    // never completed: the whole batch is lost and the failure is counted once.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 2, .reconnect_seconds = 0 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    _ = scheduler.onConnected(&worker.core, 0, started, &steps);
+
+    // The echo verified, but its send is still with the provider, so nothing is accounted yet.
+    var buffer: [12]u8 = @splat(0xAB);
+    _ = scheduler.onReceived(&worker.core, 0, &buffer, &buffer, started, &steps);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.echoes);
+
+    _ = scheduler.onTransportFailure(&worker.core, 0, started, &steps);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.echoes);
+    try std.testing.expectEqual(@as(u64, 2), worker.core.statistics.lost);
+    try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.network_errors);
+}
