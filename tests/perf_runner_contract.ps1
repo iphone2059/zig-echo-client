@@ -16,7 +16,7 @@ $tcp = [pscustomobject]@{
     socket_buffer_bytes = 0; echo_count = 17
 }
 $tcpArgs = @(New-ClientArguments -Case $tcp -Port 7000)
-$expectedTcp = @('127.0.0.1','/p','tcp','/r','7000','/n','17','/c','8','/threads','2','/k','8','/z','128','/t','30','/cq','4096','/memory','2147483648','/b','0','/q','/stats')
+$expectedTcp = @('127.0.0.1','/p','tcp','/r','7000','/n','17','/c','8','/threads','2','/k','8','/z','128','/t','120','/cq','4096','/memory','2147483648','/b','0','/q','/stats')
 Assert-True (($tcpArgs -join '|') -ceq ($expectedTcp -join '|')) "wrong TCP arguments: $($tcpArgs -join ' ')"
 Assert-True (-not ($tcpArgs -contains '/w')) 'benchmark client must not have /w'
 $alternateHost = @(New-ClientArguments -Case $tcp -Port 7000 -HostAddress '127.0.0.2')
@@ -41,7 +41,7 @@ Assert-True $threw 'zero finite count must be rejected'
 $run = [pscustomobject]@{
     exit_code = 0; elapsed_ms = 10000; echoed = 17; expected_echo_count = 17
     bytes = 2176; expected_bytes = 2176; lost = 0; corrupted = 0
-    network_errors = 0; peer_sha256 = ('a' * 64); optimize_mode = 'ReleaseFast'
+    network_errors = 0; peer_sha256 = ('a' * 64); optimize_mode = 'ReleaseFast'; reported_elapsed_ms = 10000
 }
 Assert-True (Test-BenchmarkRun -Run $run -ExpectedPeerSha256 ('a' * 64)) 'valid run rejected'
 foreach ($mutation in @(
@@ -53,7 +53,8 @@ foreach ($mutation in @(
     @{ field = 'corrupted'; value = 1 },
     @{ field = 'network_errors'; value = 1 },
     @{ field = 'peer_sha256'; value = ('b' * 64) },
-    @{ field = 'optimize_mode'; value = 'ReleaseSafe' }
+    @{ field = 'optimize_mode'; value = 'ReleaseSafe' },
+    @{ field = 'reported_elapsed_ms'; value = 9999 }
 )) {
     $candidate = $run.PSObject.Copy()
     $candidate.($mutation.field) = $mutation.value

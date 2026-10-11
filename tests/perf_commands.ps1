@@ -40,7 +40,7 @@ function New-ClientArguments {
         '/c',[string]$sessions,'/threads',[string]$threads
     )
     if ($protocol -ceq 'tcp') { $arguments += @('/k',[string]$pipeline) }
-    $arguments += @('/z',[string]$payload,'/t','30','/cq',[string]$cq,
+    $arguments += @('/z',[string]$payload,'/t','120','/cq',[string]$cq,
         '/memory',[string]$memory,'/b',[string]$socketBuffer,'/q','/stats')
     return [string[]]$arguments
 }
@@ -54,11 +54,13 @@ function Test-BenchmarkRun {
     )
 
     $required = @('exit_code','elapsed_ms','echoed','expected_echo_count','bytes','expected_bytes',
-        'lost','corrupted','network_errors','peer_sha256','optimize_mode')
+        'lost','corrupted','network_errors','peer_sha256','optimize_mode','reported_elapsed_ms')
     foreach ($field in $required) {
         if ($null -eq $Run.PSObject.Properties[$field]) { return $false }
     }
-    return $Run.exit_code -eq 0 -and $Run.elapsed_ms -ge 10000 -and
+    # Both clocks have to agree that the workload ran long enough to mean anything: the wall clock
+    # proves the process lived, the programme's own elapsed proves the load ran.
+    return $Run.exit_code -eq 0 -and $Run.elapsed_ms -ge 10000 -and $Run.reported_elapsed_ms -ge 10000 -and
         $Run.echoed -eq $Run.expected_echo_count -and $Run.bytes -eq $Run.expected_bytes -and
         $Run.lost -eq 0 -and $Run.corrupted -eq 0 -and $Run.network_errors -eq 0 -and
         [string]::Equals($Run.peer_sha256, $ExpectedPeerSha256, [StringComparison]::OrdinalIgnoreCase) -and
