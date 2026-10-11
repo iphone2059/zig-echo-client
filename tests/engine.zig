@@ -18,6 +18,20 @@ fn testClock() native.clock.Clock {
 
 /// Builds a worker record that owns only host memory, so a state-machine test never touches a
 /// registered buffer or a completion port it did not create.
+/// Reports both native operations of an attempt the way the provider delivers a verified echo: the
+/// send completes first, then the receive. The settlement happens on the second one.
+fn verifiedEcho(core: *client.worker.Core, index: u32, now: u64, out: []scheduler.Step) []const scheduler.Step {
+    const bytes: usize = core.sessions[index].attempt_bytes;
+    // One buffer pair wide enough for the largest attempt these cases build, and the bound is
+    // checked rather than assumed so an oversized case fails loudly instead of slicing past the end.
+    var expected: [32 * 1024]u8 = @splat(0xAB);
+    var echoed: [32 * 1024]u8 = @splat(0xAB);
+    if (bytes > expected.len) return out[0..0];
+    const sent = scheduler.onSent(core, index, now, out);
+    const received = scheduler.onReceived(core, index, echoed[0..bytes], expected[0..bytes], now, out[sent.len..]);
+    return out[0 .. sent.len + received.len];
+}
+
 fn buildWorker(
     sessions: []Session,
     slots: []client.native.transport.Slot,
@@ -115,13 +129,13 @@ test "client per-session quota trims the last batch to the remaining grant" {
     try std.testing.expectEqual(@as(usize, 2), first.len);
     try std.testing.expectEqual(@as(u64, 8), sessions[0].requested_echoes);
     // A settled attempt starts the next one; the last batch is trimmed, never refused.
-    _ = scheduler.onAttemptSettled(&worker.core, 0, started, false, &steps);
+    _ = verifiedEcho(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(u64, 8), sessions[0].requested_echoes);
-    _ = scheduler.onAttemptSettled(&worker.core, 0, started, false, &steps);
+    _ = verifiedEcho(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(u64, 1), sessions[0].requested_echoes);
     try std.testing.expectEqual(@as(u64, 17), worker.core.statistics.attempted);
     try std.testing.expectEqual(@as(u64, 16), sessions[0].settled);
-    const exhausted = scheduler.onAttemptSettled(&worker.core, 0, started, false, &steps);
+    const exhausted = verifiedEcho(&worker.core, 0, started, &steps);
     // The quota is spent, so the generation is retired instead of being left open: a session with
     // nothing left to echo must not hold a socket the peer can never close.
     try std.testing.expectEqual(@as(usize, 1), exhausted.len);
@@ -145,7 +159,7 @@ test "client latency sample is one completed batch" {
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
     sessions[0].attempt_started_ticks = started -| worker.core.clock.millisecondsToTicks(2);
-    _ = scheduler.onAttemptSettled(&worker.core, 0, started, false, &steps);
+    _ = verifiedEcho(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.latency_samples);
     try std.testing.expect(worker.core.statistics.latency_samples == worker.core.statistics.sampleCount());
     try std.testing.expectEqual(@as(u64, 4), worker.core.statistics.echoes);

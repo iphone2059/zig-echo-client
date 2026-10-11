@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const metrics = @import("metrics.zig");
 const native = @import("native.zig");
 const types = @import("types.zig");
+const payload = @import("payload.zig");
 
 const c = native.sdk.c;
 
@@ -181,6 +182,9 @@ pub const session = struct {
         /// mirror of the posted request, which is what the reference calls receive_posted; the native
         /// counter is never consulted for a state decision.
         receive_posted: bool = false,
+        /// The verdict this attempt's receive produced. It is part of the flow, so it survives from
+        /// the completion that decided it to the settlement that accounts for it.
+        receive_corrupted: bool = false,
         attempt_accounted: bool = false,
         reconnect_after_close: bool = false,
 
@@ -301,17 +305,58 @@ pub const session = struct {
             return entry.send_done and entry.receive_done and !entry.receive_posted;
         }
 
-        /// Settles one completed attempt. A verified attempt counts its bytes and its echoes; a
-        /// corrupted one counts the same units as corrupted and none as bytes. The latency sample is
-        /// the whole attempt, which is one batch.
-        pub fn onAttemptSettled(core: *worker.Core, index: u32, now: u64, corrupt: bool, out: []Step) []const Step {
+        /// One completed send for the active attempt. The transport reports which operation came
+        /// home; the attempt's own bookkeeping and the settlement decision are here.
+        pub fn onSent(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
             if (index >= core.sessions.len) {
                 core.markFatal();
                 return out[0..0];
             }
             const entry = &core.sessions[index];
+            if (entry.state != .active) return out[0..0];
+            if (entry.attempt_bytes == 0 or entry.send_done) {
+                // A send completion for an attempt that has no send outstanding, or that already
+                // reported one, is an accounting failure rather than something to absorb.
+                core.markFatal();
+                return out[0..0];
+            }
+            entry.send_done = true;
+            if (!attemptSettled(entry)) return out[0..0];
+            return settleAttempt(core, index, now, out);
+        }
+
+        /// One completed receive. The verdict is decided here rather than by the transport: the
+        /// reference hands the received and the expected bytes to the session and lets it classify
+        /// the outcome, and this does the same.
+        pub fn onReceived(core: *worker.Core, index: u32, echoed: []const u8, expected: []const u8, now: u64, out: []Step) []const Step {
+            if (index >= core.sessions.len) {
+                core.markFatal();
+                return out[0..0];
+            }
+            const entry = &core.sessions[index];
+            if (entry.state != .active) return out[0..0];
+            if (entry.attempt_bytes == 0 or entry.receive_done) {
+                core.markFatal();
+                return out[0..0];
+            }
+            // The native request ended when its completion was dequeued, which is where the reference
+            // clears the same flag.
+            entry.receive_posted = false;
+            // Exact comparison: a short read is a failure, never a partial success. A short TCP read
+            // is already a connection failure by the time this runs; a short datagram is corrupted.
+            entry.receive_corrupted = !payload.verify(echoed, expected);
+            entry.receive_done = true;
+            if (!attemptSettled(entry)) return out[0..0];
+            return settleAttempt(core, index, now, out);
+        }
+
+        /// Settles one completed attempt. A verified attempt counts its bytes and its echoes; a
+        /// corrupted one counts the same units as corrupted and none as bytes. The latency sample is
+        /// the whole attempt, which is one batch.
+        fn settleAttempt(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
+            const entry = &core.sessions[index];
             if (entry.state == .closing or entry.state == .done) return out[0..0];
-            if (corrupt) {
+            if (entry.receive_corrupted) {
                 core.statistics.corrupted +|= entry.requested_echoes;
             } else {
                 core.statistics.echoes +|= entry.requested_echoes;
@@ -404,6 +449,8 @@ pub const session = struct {
             entry.received_bytes = 0;
             entry.send_done = false;
             entry.receive_done = false;
+            entry.receive_posted = false;
+            entry.receive_corrupted = false;
             entry.attempt_accounted = false;
             entry.state = .active;
             entry.active_counted = true;

@@ -670,7 +670,7 @@ pub fn handleRioResult(comptime protocol: types.Protocol, wrk: *Worker, result: 
                 if (!postSend(wrk, entry)) failSession(protocol, wrk, entry.index);
                 return;
             }
-            entry.send_done = true;
+            completeSend(protocol, wrk, entry.index);
         },
         .receive => {
             if (protocol == .tcp and result.BytesTransferred != entry.attempt_bytes) {
@@ -679,31 +679,34 @@ pub fn handleRioResult(comptime protocol: types.Protocol, wrk: *Worker, result: 
             }
             wrk.core.statistics.received_bytes +|= result.BytesTransferred;
             entry.received_bytes = result.BytesTransferred;
-            // The native request ended when its completion was dequeued, which is where the reference
-            // clears the same flag.
-            entry.receive_posted = false;
-            entry.receive_done = true;
+            completeReceive(protocol, wrk, entry.index);
         },
         .connect, .generation_drained => unreachable,
     }
-    // The settlement condition is the scheduler's, stated in business terms, so the transport is
-    // never consulted for a state decision.
-    if (!internal.session.scheduler.attemptSettled(entry)) return;
-    const expected = wrk.transport.arena.sendBytes(entry.index, @intCast(entry.attempt_bytes)) orelse
+}
+
+/// Hands a completed send to the scheduler, which owns the attempt's bookkeeping and decides whether
+/// the attempt settles. The engine only executes what comes back.
+fn completeSend(comptime protocol: types.Protocol, wrk: *Worker, index: u32) void {
+    const region = wrk.core.acquireRegion();
+    dispatch(protocol, wrk, internal.session.scheduler.onSent(&wrk.core, index, wrk.core.clock.nowTicks(), region));
+    wrk.core.releaseRegion();
+}
+
+/// Hands a completed receive to the scheduler. Resolving the registered windows is the engine's job
+/// because they are registered memory; classifying the result is not.
+fn completeReceive(comptime protocol: types.Protocol, wrk: *Worker, index: u32) void {
+    const entry = &wrk.core.sessions[index];
+    const expected = wrk.transport.arena.sendBytes(index, @intCast(entry.attempt_bytes)) orelse
         native.diagnostics.failFast("client send window", c.ERROR_INVALID_DATA);
     const echoed: []const u8 = if (entry.received_bytes == 0)
         &[_]u8{}
     else
-        (wrk.transport.arena.receiveBytes(entry.index, @intCast(entry.received_bytes)) orelse
+        (wrk.transport.arena.receiveBytes(index, @intCast(entry.received_bytes)) orelse
             native.diagnostics.failFast("client receive window", c.ERROR_INVALID_DATA));
-    // Exact comparison: a short read is a failure, never a partial success. A short TCP read is
-    // already a connection failure above; a short datagram is a corrupted echo.
-    const corrupt = !payload.verify(echoed, expected[0..entry.attempt_bytes]);
-    {
-        const region = wrk.core.acquireRegion();
-        dispatch(protocol, wrk, internal.session.scheduler.onAttemptSettled(&wrk.core, entry.index, wrk.core.clock.nowTicks(), corrupt, region));
-        wrk.core.releaseRegion();
-    }
+    const region = wrk.core.acquireRegion();
+    dispatch(protocol, wrk, internal.session.scheduler.onReceived(&wrk.core, index, echoed, expected[0..entry.attempt_bytes], wrk.core.clock.nowTicks(), region));
+    wrk.core.releaseRegion();
 }
 
 /// Runs the steps the scheduler decided on. A failed post leaves the generation closing, so the
