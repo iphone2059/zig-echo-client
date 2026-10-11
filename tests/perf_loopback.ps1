@@ -10,6 +10,8 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][string]$Label,
     [long]$EchoCountOverride = 0,
+    # Formal performance data must come from the mode it claims; '' disables the requirement.
+    [string]$RequireOptimizeMode = 'ReleaseFast',
     [switch]$DescribeOnly
 )
 
@@ -32,6 +34,9 @@ if ($Label -cnotmatch '^[A-Za-z0-9_-]+$') { throw 'label must contain only lette
 
 $clientExe = (Resolve-Path -LiteralPath $ClientPath -ErrorAction Stop).Path
 $peerExe = (Resolve-Path -LiteralPath $PeerPath -ErrorAction Stop).Path
+# The measured binary is proven against its build manifest before the run starts, so a binary swapped
+# in after the build is refused rather than measured under the old identity.
+$clientManifest = Assert-ExecutableIdentity -Path $clientExe -RequiredOptimizeMode $RequireOptimizeMode
 $peerProcess = Get-Process -Id $PeerPid -ErrorAction Stop
 try {
     $runningPath = [IO.Path]::GetFullPath($peerProcess.Path)
@@ -79,13 +84,14 @@ if ($final.Count -eq 1) {
         $fields[$matchValue.Groups[1].Value] = $matchValue.Groups[2].Value
     }
 }
-$expectedBytes = [long]$workload.echo_count * [long]$workload.payload_bytes
+$totals = Get-WorkloadTotals -Case $workload
+$expectedBytes = $totals.bytes
 $run = [pscustomobject]@{
     exit_code = $exitCode
     elapsed_ms = [long]$timer.ElapsedMilliseconds
     process_cpu_ms = $cpuMilliseconds
     echoed = if ($fields.ContainsKey('echoed')) { [long]$fields.echoed } else { -1 }
-    expected_echo_count = [long]$workload.echo_count
+    expected_echo_count = $totals.echoes
     bytes = if ($fields.ContainsKey('bytes')) { [long]$fields.bytes } else { -1 }
     expected_bytes = $expectedBytes
     lost = if ($fields.ContainsKey('lost')) { [long]$fields.lost } else { -1 }
@@ -95,7 +101,9 @@ $run = [pscustomobject]@{
     client_sha256 = (Get-FileHash -LiteralPath $clientExe -Algorithm SHA256).Hash.ToLowerInvariant()
     client_commit = Get-ExecutableCommit -Path $clientExe
     peer_commit = Get-ExecutableCommit -Path $peerExe -AllowUnknown
-    optimize_mode = Get-ExecutableOptimizeMode -Path $clientExe
+    optimize_mode = $clientManifest.optimize_mode
+    manifest_source_commit = $clientManifest.source_commit
+    manifest_zig_version = $clientManifest.zig_version
     peer_optimize_mode = Get-ExecutableOptimizeMode -Path $peerExe -AllowUnknown
     client_path = $clientExe
     peer_path = $peerExe
@@ -113,7 +121,7 @@ $run = [pscustomobject]@{
     stderr_length = $stderr.Length
     timed_out = $timedOut
 }
-$run | Add-Member -NotePropertyName valid -NotePropertyValue ((Test-BenchmarkRun -Run $run -ExpectedPeerSha256 $ExpectedPeerSha256) -and $stderr.Length -eq 0)
+$run | Add-Member -NotePropertyName valid -NotePropertyValue ((Test-BenchmarkRun -Run $run -ExpectedPeerSha256 $ExpectedPeerSha256 -RequiredOptimizeMode $RequireOptimizeMode) -and $stderr.Length -eq 0)
 $run | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $metadataPath -Encoding utf8
 Write-Output "benchmark_run=$metadataPath valid=$($run.valid) elapsed_ms=$($run.elapsed_ms) echoed=$($run.echoed)"
 if (-not $run.valid) { throw "invalid benchmark run; inspect $metadataPath" }
