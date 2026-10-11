@@ -571,3 +571,66 @@ test "a reconnect is counted at the failure that triggers it" {
     try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.reconnects);
     try std.testing.expect(sessions[0].reconnect_after_close);
 }
+
+/// Counts the steps of one tag, which is how the reference tests assert a sequence without
+/// depending on the order the scheduler happened to build it in.
+fn countSteps(steps: []const scheduler.Step, comptime tag: std.meta.Tag(scheduler.Step)) usize {
+    var total: usize = 0;
+    for (steps) |step| {
+        if (std.meta.activeTag(step) == tag) total += 1;
+    }
+    return total;
+}
+
+test "a receive completion waits for the send before settling the attempt" {
+    // Mirrors the reference's receive_completion_waits_for_send_before_settling_the_attempt: a
+    // receive that lands first must not account anything until its send retires, because the
+    // settlement is what turns a batch into echoes.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 2 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    _ = scheduler.onConnected(&worker.core, 0, started, &steps);
+
+    var buffer: [12]u8 = @splat(0xAB);
+    const before_send = scheduler.onReceived(&worker.core, 0, &buffer, &buffer, started, &steps);
+    try std.testing.expectEqual(@as(usize, 0), before_send.len);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.echoes);
+    try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.bytes);
+    // The attempt is still in flight, so its deadline stays armed.
+    try std.testing.expect(sessions[0].deadline_ticks != 0);
+
+    _ = scheduler.onSent(&worker.core, 0, started, &steps);
+    try std.testing.expectEqual(@as(u64, 2), worker.core.statistics.echoes);
+}
+
+test "a receive may complete before the send without posting a second attempt" {
+    // Mirrors receive_may_complete_before_send_without_posting_a_second_attempt: RIO completion
+    // ordering between send and receive is not a business ordering guarantee, so a verified echo
+    // that arrives first must be held rather than starting a second attempt.
+    var sessions: [1]Session = .{.{}};
+    var slots: [1]client.native.transport.Slot = @splat(.{});
+    var steps: [3]scheduler.Step = undefined;
+    var nodes: [1]timer.Node = undefined;
+    var positions: [1]u32 = undefined;
+    const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 1 };
+    var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
+    const started = worker.core.clock.nowTicks();
+    _ = scheduler.start(&worker.core, started, &steps);
+    const initial = scheduler.onConnected(&worker.core, 0, started, &steps);
+    try std.testing.expectEqual(@as(usize, 1), countSteps(initial, .send));
+    try std.testing.expectEqual(@as(usize, 1), countSteps(initial, .receive));
+
+    var buffer: [6]u8 = @splat(0xAB);
+    const after_receive = scheduler.onReceived(&worker.core, 0, &buffer, &buffer, started, &steps);
+    try std.testing.expectEqual(@as(usize, 0), countSteps(after_receive, .send));
+    try std.testing.expect(sessions[0].attempt_bytes != 0);
+
+    const after_send = scheduler.onSent(&worker.core, 0, started, &steps);
+    try std.testing.expect(countSteps(after_send, .send) >= 1);
+}
