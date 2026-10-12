@@ -156,9 +156,6 @@ pub const session = struct {
     pub const Session = struct {
         index: u32 = 0,
         state: State = .dormant,
-        /// Bumped for every new transport generation. It is carried in every request context, so a
-        /// completion belonging to a retired generation can never steer the live state machine.
-        generation: u32 = 0,
         /// Set while this session counts towards the report's active total.
         active_counted: bool = false,
         /// Echo units the per-session quota has granted this session.
@@ -170,8 +167,6 @@ pub const session = struct {
         /// a failed attempt already spent instead of handing it back.
         settled: u64 = 0,
         attempt_bytes: usize = 0,
-        send_offset: usize = 0,
-        received_bytes: usize = 0,
         deadline_ticks: u64 = 0,
         send_at_ticks: u64 = 0,
         reconnect_at_ticks: u64 = 0,
@@ -202,6 +197,9 @@ pub const session = struct {
             send: struct { index: u32, bytes: u32 },
             receive: struct { index: u32, bytes: u32 },
             close: u32,
+            /// The pure deadline expired; only transport can verify whether provider ownership
+            /// still exists and enforce the native fail-fast boundary.
+            drain_timeout: u32,
         };
 
         /// The first attempt of a transport generation is immediate; the interval spaces only later
@@ -211,7 +209,6 @@ pub const session = struct {
             for (core.sessions) |*entry| {
                 if (entry.state != .dormant) continue;
                 entry.state = .connecting;
-                entry.received_bytes = 0;
                 entry.send_at_ticks = 0;
                 entry.reconnect_at_ticks = 0;
                 entry.deadline_ticks = now +| core.timeout_ticks;
@@ -235,6 +232,17 @@ pub const session = struct {
             core.armTimer(index, entry.deadline_ticks);
         }
 
+        pub fn anchorClose(core: *worker.Core, index: u32, first_close: u64) void {
+            if (index >= core.sessions.len) {
+                core.markFatal();
+                return;
+            }
+            const entry = &core.sessions[index];
+            if (entry.state != .closing) return;
+            entry.deadline_ticks = first_close +| core.drain_grace_ticks;
+            core.armTimer(index, entry.deadline_ticks);
+        }
+
         /// Everything that became due: an expired deadline fails the attempt, a pacing timer starts
         /// the next attempt, and a reconnect timer opens a new transport generation.
         pub fn poll(core: *worker.Core, now: u64, out: []Step) []const Step {
@@ -251,12 +259,11 @@ pub const session = struct {
                         // The grace expired: the generation never drained, so no further progress is
                         // possible and the terminal accounting must not claim a clean stop.
                         core.markFatal();
+                        count += core.emit(out, count, .{ .drain_timeout = index });
                     },
                     .pacing => count += beginAttempt(core, entry, now, out, count),
                     .reconnecting => {
-                        entry.generation = native.completion.nextGeneration(entry.generation);
                         entry.state = .connecting;
-                        entry.received_bytes = 0;
                         entry.send_at_ticks = 0;
                         entry.reconnect_at_ticks = 0;
                         count += core.emit(out, count, .{ .connect = index });
@@ -397,6 +404,7 @@ pub const session = struct {
                 return out[0..0];
             }
             const entry = &core.sessions[index];
+            if (entry.state != .closing) return out[0..0];
             _ = core.timers.remove(index);
             if (entry.reconnect_after_close and !core.stopping) {
                 entry.state = .reconnecting;
@@ -408,16 +416,31 @@ pub const session = struct {
             return out[0..0];
         }
 
-        /// A controlled stop leaves every unfinished attempt claimed but unsettled: those units are
-        /// reported as cancelled by the run, not as losses.
+        /// Stop settles each unfinished attempt before native cancellation starts. A controlled
+        /// stop counts it as cancelled; a fatal stop counts it as lost, matching the reference.
         pub fn beginShutdown(core: *worker.Core) void {
+            beginShutdownAt(core, 0);
+        }
+
+        pub fn beginShutdownAt(core: *worker.Core, now: u64) void {
             if (core.stopping) return;
             core.stopping = true;
             for (core.sessions) |*entry| {
                 if (entry.state == .done) continue;
-                _ = core.timers.remove(entry.index);
+                if (entry.state == .active and !entry.attempt_accounted) {
+                    if (core.statistics.fatal) {
+                        core.statistics.lost +|= entry.requested_echoes;
+                    } else {
+                        core.statistics.cancelled +|= entry.requested_echoes;
+                    }
+                    entry.settled +|= entry.requested_echoes;
+                    entry.attempt_accounted = true;
+                }
                 entry.reconnect_after_close = false;
-                entry.state = .closing;
+                if (entry.state != .closing) {
+                    entry.state = .closing;
+                    armClose(core, entry, now);
+                }
             }
         }
 
@@ -455,8 +478,6 @@ pub const session = struct {
             }
             entry.requested_echoes = granted;
             entry.attempt_bytes = attempt_bytes;
-            entry.send_offset = 0;
-            entry.received_bytes = 0;
             entry.send_done = false;
             entry.receive_done = false;
             entry.receive_posted = false;
@@ -531,7 +552,7 @@ pub const session = struct {
 };
 
 pub const worker = struct {
-    pub const Phase = enum(u8) { starting, running, draining, stopped };
+    pub const Phase = types.WorkerPhase;
 
     /// One completion whose request context decoded successfully. The native ownership accounting
     /// has already been retired by the engine before this record exists.
@@ -539,9 +560,25 @@ pub const worker = struct {
         index: u32,
         generation: u32,
         slot: u32,
-        operation: native.completion.Operation,
+        operation: types.Operation,
         status: i32,
         bytes: u32,
+    };
+
+    /// Events contain business input after transport has retired native ownership.
+    pub const Event = union(enum) {
+        connected: u32,
+        sent: u32,
+        received: struct { index: u32, echoed: []const u8, expected: []const u8 },
+        transport_failure: u32,
+        generation_drained: u32,
+    };
+    pub const Action = session.scheduler.Step;
+    pub const Lifecycle = struct {
+        phase: Phase,
+        live_sessions: u32,
+        total_outstanding: u32,
+        rio_outstanding: u32,
     };
 
     /// A per-worker progress snapshot.
@@ -621,7 +658,7 @@ pub const worker = struct {
         index: u32 = 0,
         session_count: u32 = 0,
         options: *const types.Options = undefined,
-        clock: native.clock.Clock = .{},
+        ticks_per_second: u64 = 1_000,
         payload_bytes: usize = 0,
         timeout_ticks: u64 = 0,
         interval_ticks: u64 = 0,
@@ -629,7 +666,6 @@ pub const worker = struct {
         reconnect_enabled: bool = false,
         /// The bounded grace a closing generation gets before its silence is fatal.
         drain_grace_ticks: u64 = 0,
-        receive_flags: u32 = 0,
 
         statistics: metrics.Statistics = .{},
         bench_histogram: metrics.WorkerHistogram = if (metrics.benchmark_enabled) metrics.Histogram{} else {},
@@ -644,16 +680,20 @@ pub const worker = struct {
         timer_positions: []u32 = &.{},
         timers: timer.Heap = .{},
 
-        progress: ?*Progress = null,
-        progress_interval_ticks: u64 = 0,
-        next_progress_ticks: u64 = 0,
-
-        phase: Phase = .starting,
         stopping: bool = false,
-
 
         pub fn markFatal(self: *Core) void {
             self.statistics.fatal = true;
+        }
+
+        pub fn onEvent(self: *Core, event: Event, now: u64, out: []Action) []const Action {
+            return switch (event) {
+                .connected => |index| session.scheduler.onConnected(self, index, now, out),
+                .sent => |index| session.scheduler.onSent(self, index, now, out),
+                .received => |received| session.scheduler.onReceived(self, received.index, received.echoed, received.expected, now, out),
+                .transport_failure => |index| session.scheduler.onTransportFailure(self, index, now, out),
+                .generation_drained => |index| session.scheduler.onGenerationDrained(self, index, now, out),
+            };
         }
 
         pub fn armTimer(self: *Core, index: u32, deadline: u64) void {
@@ -671,7 +711,6 @@ pub const worker = struct {
                 self.markFatal();
                 return 0;
             }
-            trace.eventArgs("STEP", "step={s}", .{@tagName(step)});
             out[position] = step;
             return 1;
         }
@@ -718,29 +757,20 @@ pub const worker = struct {
             return count;
         }
 
-        /// Publishes the ledger into the shared snapshot. A forced publish is the terminal one.
-        pub fn publish(self: *Core, now: u64, force: bool) void {
-            const snapshot = self.progress orelse return;
-            if (!force and now < self.next_progress_ticks) return;
-            const active = self.activeSessions();
-            snapshot.store(&self.statistics, active);
-            self.next_progress_ticks = now +| self.progress_interval_ticks;
-        }
-
         pub fn recordLatency(self: *Core, ticks: u64) void {
-            const micros: u64 = if (self.clock.frequency == 0)
+            const micros: u64 = if (self.ticks_per_second == 0)
                 1
             else
-                @intCast(@max(@as(u128, 1), @as(u128, ticks) * 1_000_000 / @as(u128, self.clock.frequency)));
+                @intCast(@min(std.math.maxInt(u64), @max(@as(u128, 1), @as(u128, ticks) * 1_000_000 / @as(u128, self.ticks_per_second))));
             self.statistics.recordLatency(micros);
             if (metrics.benchmark_enabled) self.bench_histogram.record(micros);
         }
 
         pub fn elapsedMilliseconds(self: *const Core, now: u64, started: u64) u64 {
             if (now <= started) return 0;
-            return self.clock.ticksToMilliseconds(now - started);
+            if (self.ticks_per_second == 0) return 0;
+            return @intCast(@min(std.math.maxInt(u64), @as(u128, now - started) * 1_000 / self.ticks_per_second));
         }
-
     };
 
     /// The native half of a worker: every object the kernel owns on its behalf, and the ownership
@@ -756,11 +786,14 @@ pub const worker = struct {
         api: ?*const native.rio.Api = null,
         connect_ex: ?c.LPFN_CONNECTEX = null,
         remote_address: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN),
+        receive_flags: u32 = 0,
         notification_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
+        notification_owner: ?*anyopaque = null,
 
         notification_arms: u64 = 0,
         notification_deliveries: u64 = 0,
         timeout_wakeups_while_outstanding: u64 = 0,
+        sent_bytes: u64 = 0,
 
         /// Operations the provider still owns across every session.
         pub fn outstanding(self: *const RioTransport) u32 {
@@ -777,11 +810,44 @@ pub const worker = struct {
         transport: RioTransport = .{},
         /// The worker's own thread, which is runtime lifecycle rather than transport ownership.
         thread: native.handle.Handle = .{},
+        clock: native.clock.Clock = .{},
+        progress: ?*Progress = null,
+        progress_interval_ticks: u64 = 0,
+        next_progress_ticks: u64 = 0,
+        phase: Phase = .starting,
+        started: bool = false,
+        joined: bool = false,
+        initialization_failure: ?types.Failure = null,
+
+        pub fn publish(self: *Worker, now: u64, force: bool) void {
+            const snapshot = self.progress orelse return;
+            if (!force and now < self.next_progress_ticks) return;
+            snapshot.store(&self.core.statistics, self.core.activeSessions());
+            self.next_progress_ticks = now +| self.progress_interval_ticks;
+        }
+
+        pub fn lifecycle(self: *const Worker) Lifecycle {
+            var rio_outstanding: u32 = 0;
+            for (self.transport.slots) |slot| rio_outstanding += slot.send_outstanding + slot.receive_outstanding;
+            return .{ .phase = self.phase, .live_sessions = self.core.liveSessions(), .total_outstanding = self.transport.outstanding(), .rio_outstanding = rio_outstanding };
+        }
+
+        /// Partial construction has no submitted operations. A started worker must have crossed
+        /// the join barrier and reached its terminal lifecycle before any provider-owned storage
+        /// can be released. Keep this check inside the actual release entry point.
+        pub fn requireReleasePreconditions(self: *const Worker) void {
+            const state = self.lifecycle();
+            if (state.total_outstanding != 0 or state.rio_outstanding != 0) native.diagnostics.failFast("client worker release precondition", c.ERROR_IO_INCOMPLETE);
+            if (self.started and (!self.joined or state.phase != .stopped or state.live_sessions != 0 or self.core.timers.len != 0)) {
+                native.diagnostics.failFast("client worker release precondition", c.ERROR_INVALID_STATE);
+            }
+        }
 
         /// The release order the design fixes: retire outstanding operations, close the completion
         /// queue and its notification state, deregister every buffer, release the single virtual
         /// allocation, free the host-side arrays, and only then close the completion port.
         pub fn release(self: *Worker, allocator: std.mem.Allocator) void {
+            self.requireReleasePreconditions();
             for (self.transport.slots) |*slot| slot.close();
             self.transport.completion_queue.deinit();
             self.transport.arena.deinit();
@@ -798,7 +864,7 @@ pub const worker = struct {
             self.core.timers = .{};
             self.transport.port.deinit();
             self.thread.deinit();
-            self.core.phase = .stopped;
+            self.phase = .stopped;
         }
     };
 };

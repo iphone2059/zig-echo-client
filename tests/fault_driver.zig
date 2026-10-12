@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) u8 {
         held.worker = .{};
         held.worker.transport.slots = &held.slots;
         held.worker.core.session_count = 1;
-        engine.requireReleasePreconditions(&held.worker);
+        held.worker.release(std.heap.page_allocator);
     } else if (std.mem.eql(u8, mode, "outstanding_cq_retirement")) {
         var held = workerWithOutstanding(1);
         held.worker = .{};

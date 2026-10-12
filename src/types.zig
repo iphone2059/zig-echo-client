@@ -30,6 +30,22 @@ pub const ExitCode = enum(u8) {
 /// The phases a worker passes through, in order.
 pub const WorkerPhase = enum(u8) { starting, running, draining, stopped };
 
+/// Normalized operations and errors are shared values, independent of a native ABI.
+pub const Operation = enum(u8) { connect = 1, send = 2, receive = 3, generation_drained = 4 };
+pub const ErrorDomain = enum { win32, winsock, allocation, capacity, invariant };
+pub const ErrorCategory = enum { initialization, connection, provider, invariant };
+pub const Failure = struct {
+    stage: []const u8,
+    native_code: u32,
+    domain: ErrorDomain,
+    category: ErrorCategory = .initialization,
+    retryable: bool = false,
+};
+
+pub fn Result(comptime T: type) type {
+    return union(enum) { success: T, failure: Failure };
+}
+
 /// The session-count bound. The quota arithmetic refuses anything larger before a session exists.
 pub const maximum_sessions: u32 = 1_048_576;
 

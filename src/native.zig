@@ -51,6 +51,7 @@ pub const sdk = struct {
         pub const ERROR_IO_PENDING: DWORD = 997;
         pub const ERROR_IO_INCOMPLETE: DWORD = 996;
         pub const ERROR_INVALID_STATE: DWORD = 5023;
+        pub const ERROR_TIMEOUT: DWORD = 1460;
         pub const INFINITE: DWORD = 0xffffffff;
         pub const MEM_COMMIT: DWORD = 0x1000;
         pub const MEM_RESERVE: DWORD = 0x2000;
@@ -222,6 +223,16 @@ pub const sdk = struct {
 
 const c = sdk.c;
 
+fn reportResult(result: types.Result(void)) bool {
+    return switch (result) {
+        .success => true,
+        .failure => |failure| blk: {
+            diagnostics.report(failure.stage, failure.native_code);
+            break :blk false;
+        },
+    };
+}
+
 /// Console and error reporting. Every native failure is described here so no call site has to
 /// invent its own wording.
 pub const diagnostics = struct {
@@ -357,25 +368,27 @@ pub const socket = struct {
     }
 
     pub fn configure(value: c.SOCKET, socket_buffer_bytes: u32, tcp: bool) bool {
+        return reportResult(configureResult(value, socket_buffer_bytes, tcp));
+    }
+
+    pub fn configureResult(value: c.SOCKET, socket_buffer_bytes: u32, tcp: bool) types.Result(void) {
         if (socket_buffer_bytes != 0) {
             var size: c_int = @intCast(socket_buffer_bytes);
             const pointer: [*c]const u8 = @ptrCast(&size);
             if (c.setsockopt(value, c.SOL_SOCKET, c.SO_SNDBUF, pointer, @intCast(@sizeOf(c_int))) != 0 or
                 c.setsockopt(value, c.SOL_SOCKET, c.SO_RCVBUF, pointer, @intCast(@sizeOf(c_int))) != 0)
             {
-                diagnostics.report("setsockopt(SO_SNDBUF/SO_RCVBUF)", @intCast(c.WSAGetLastError()));
-                return false;
+                return .{ .failure = .{ .stage = "setsockopt(SO_SNDBUF/SO_RCVBUF)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
             }
         }
         if (tcp) {
             var enabled: c.BOOL = c.TRUE;
             const pointer: [*c]const u8 = @ptrCast(&enabled);
             if (c.setsockopt(value, c.IPPROTO_TCP, c.TCP_NODELAY, pointer, @intCast(@sizeOf(c.BOOL))) != 0) {
-                diagnostics.report("setsockopt(TCP_NODELAY)", @intCast(c.WSAGetLastError()));
-                return false;
+                return .{ .failure = .{ .stage = "setsockopt(TCP_NODELAY)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
             }
         }
-        return true;
+        return .{ .success = {} };
     }
 };
 
@@ -424,12 +437,8 @@ pub const arena = struct {
 
     /// One worker-owned virtual allocation for both directions of registered RIO memory.
     ///
-    /// TX windows precede RX windows, and each slot has a disjoint window in each region. RX uses
-    /// one registration over the whole region because the documented RIOReceive contract permits
-    /// independent receives in non-overlapping parts of one registration. TX uses one registration
-    /// per window because the documented RIOSend contract prohibits using any other portion of its
-    /// registration while the send is pending, even when those portions would otherwise be
-    /// disjoint.
+    /// TX windows precede RX windows. Each session owns an independent registration in each
+    /// direction, matching the reference's resource identities and preventing cross-session reuse.
     pub const Arena = struct {
         pages: VirtualMemory = .{},
         bytes: usize = 0,
@@ -437,39 +446,65 @@ pub const arena = struct {
         slots: u32 = 0,
         receive_offset: usize = 0,
         send_registrations: []rio.Registration = &.{},
-        receive_registration: rio.Registration = .{},
+        receive_registrations: []rio.Registration = &.{},
 
         pub fn create(api: *const rio.Api, slots: u32, stride: u32) CreateError!Arena {
-            const bytes = workerBytes(slots, stride) orelse return error.Capacity;
-            var pages = try VirtualMemory.alloc(bytes);
-            errdefer pages.deinit();
-            const registrations = allocator.alloc(rio.Registration, slots) catch return error.Allocation;
-            var registered: u32 = 0;
-            errdefer {
-                for (registrations[0..registered]) |*registration| registration.deinit();
-                allocator.free(registrations);
-            }
-            const base = pages.bytes();
-            const receive_offset: usize = bytes / 2;
-            for (0..slots) |slot| {
-                const start: usize = slot * stride;
-                registrations[slot] = .{};
-                registrations[slot].reset(api, api.registerBuffer(base + start, stride));
-                if (!registrations[slot].valid()) return error.Registration;
-                registered += 1;
-            }
-            var receive_registration: rio.Registration = .{};
-            receive_registration.reset(api, api.registerBuffer(base + receive_offset, @intCast(receive_offset)));
-            if (!receive_registration.valid()) return error.Registration;
-            return .{
-                .pages = pages,
-                .bytes = bytes,
-                .stride = stride,
-                .slots = slots,
-                .receive_offset = receive_offset,
-                .send_registrations = registrations,
-                .receive_registration = receive_registration,
+            return switch (createResult(api, slots, stride)) {
+                .success => |value| value,
+                .failure => |failure| switch (failure.domain) {
+                    .capacity, .invariant => error.Capacity,
+                    .allocation => error.Allocation,
+                    .win32 => error.VirtualAlloc,
+                    .winsock => error.Registration,
+                },
             };
+        }
+
+        /// Captures the failing API's code before rollback can change thread-local last-error.
+        pub fn createResult(api: *const rio.Api, slots: u32, stride: u32) types.Result(Arena) {
+            const bytes = workerBytes(slots, stride) orelse return .{ .failure = .{
+                .stage = "client worker arena budget",
+                .native_code = c.ERROR_NOT_ENOUGH_MEMORY,
+                .domain = .capacity,
+            } };
+            var result = Arena{ .bytes = bytes, .stride = stride, .slots = slots, .receive_offset = bytes / 2 };
+            var transferred = false;
+            defer if (!transferred) result.deinit();
+            result.pages = VirtualMemory.alloc(bytes) catch return .{ .failure = .{
+                .stage = "VirtualAlloc(worker arena)",
+                .native_code = c.GetLastError(),
+                .domain = .win32,
+            } };
+            result.send_registrations = allocator.alloc(rio.Registration, slots) catch return .{ .failure = .{
+                .stage = "client registration owners",
+                .native_code = c.ERROR_NOT_ENOUGH_MEMORY,
+                .domain = .allocation,
+            } };
+            for (result.send_registrations) |*registration| registration.* = .{};
+            result.receive_registrations = allocator.alloc(rio.Registration, slots) catch return .{ .failure = .{
+                .stage = "client registration owners",
+                .native_code = c.ERROR_NOT_ENOUGH_MEMORY,
+                .domain = .allocation,
+            } };
+            for (result.receive_registrations) |*registration| registration.* = .{};
+            const base = result.pages.bytes();
+            for (0..slots) |index| {
+                const offset: usize = index * stride;
+                result.send_registrations[index].reset(api, api.registerBuffer(base + offset, stride));
+                if (!result.send_registrations[index].valid()) return .{ .failure = .{
+                    .stage = "RIORegisterBuffer(client windows)",
+                    .native_code = @bitCast(c.WSAGetLastError()),
+                    .domain = .winsock,
+                } };
+                result.receive_registrations[index].reset(api, api.registerBuffer(base + result.receive_offset + offset, stride));
+                if (!result.receive_registrations[index].valid()) return .{ .failure = .{
+                    .stage = "RIORegisterBuffer(client windows)",
+                    .native_code = @bitCast(c.WSAGetLastError()),
+                    .domain = .winsock,
+                } };
+            }
+            transferred = true;
+            return .{ .success = result };
         }
 
         /// Deregisters every buffer while its memory is still mapped, and only then releases the
@@ -478,7 +513,9 @@ pub const arena = struct {
             for (self.send_registrations) |*registration| registration.deinit();
             if (self.send_registrations.len != 0) allocator.free(self.send_registrations);
             self.send_registrations = &.{};
-            self.receive_registration.deinit();
+            for (self.receive_registrations) |*registration| registration.deinit();
+            if (self.receive_registrations.len != 0) allocator.free(self.receive_registrations);
+            self.receive_registrations = &.{};
             self.pages.deinit();
             self.* = .{};
         }
@@ -514,8 +551,8 @@ pub const arena = struct {
 
         pub fn receiveView(self: *const Arena, slot: u32, length: u32) ?c.RIO_BUF {
             if (slot >= self.slots or length == 0 or length > self.stride) return null;
-            const offset = slotOffset(slot, self.stride, self.receive_offset) orelse return null;
-            return self.receive_registration.slice(@intCast(offset), length);
+            if (slot >= self.receive_registrations.len) return null;
+            return self.receive_registrations[slot].slice(0, length);
         }
 
         pub fn registeredBytes(self: *const Arena) usize {
@@ -531,6 +568,9 @@ pub const arena = struct {
 /// socket, and it is why only engine.zig ever touches these fields.
 pub const transport = struct {
     pub const Slot = struct {
+        generation: u32 = 0,
+        closing: bool = false,
+        drain_reported: bool = false,
         socket: socket.Socket = .{},
         /// The request queue dies with its socket, so it is tracked, never closed separately.
         request_queue: c.RIO_RQ = c.RIO_INVALID_RQ,
@@ -540,6 +580,7 @@ pub const transport = struct {
         receive_outstanding: u32 = 0,
         send_posted_bytes: u32 = 0,
         receive_posted_bytes: u32 = 0,
+        send_offset: u32 = 0,
 
         /// Operations the provider still owns. A generation may not be released while this is
         /// non-zero: closing a socket starts cancellation, it does not end the I/O.
@@ -561,11 +602,15 @@ pub const transport = struct {
 
         /// Opens a fresh generation with no operations and no handles.
         pub fn reset(self: *Slot) void {
+            if (!self.drained()) diagnostics.failFast("client generation replacement", c.ERROR_IO_INCOMPLETE);
             self.close();
             self.send_outstanding = 0;
             self.receive_outstanding = 0;
             self.send_posted_bytes = 0;
             self.receive_posted_bytes = 0;
+            self.send_offset = 0;
+            self.closing = false;
+            self.drain_reported = false;
         }
     };
 };
@@ -795,19 +840,12 @@ pub const rio = struct {
 ///
 /// The 64-bit request context is self-contained: operation, session index, send slot and transport
 /// generation are encoded directly, so no pointer-valued side table is needed. A generation
-/// mismatch is a stale completion and never steers the live state machine.
+/// mismatch violates the drain-before-reuse protocol and is rejected before ownership accounting.
 ///
-/// This is the Completion layer, not the Transport layer: it owns no kernel object -- no request
-/// queue, no completion queue, no OVERLAPPED, no socket -- and it is one of the four data kinds the
-/// methodology lets the pure engine consume. The scheduler depends on it by design.
+/// This codec belongs to the native transport boundary. Runtime receives normalized Completion
+/// values and the pure engine receives business Event values, without depending on this codec.
 pub const completion = struct {
-    pub const Operation = enum(u8) {
-        connect = 1,
-        send = 2,
-        receive = 3,
-        /// Internal transport event; never encoded into an OS request context.
-        generation_drained = 4,
-    };
+    pub const Operation = types.Operation;
 
     const op_bits: u6 = 3;
     const session_bits: u6 = 20;
@@ -963,20 +1001,26 @@ pub const endpoint = struct {
     }
 
     pub fn bindLocal(socket_value: c.SOCKET, port: u16) bool {
+        return reportResult(bindLocalResult(socket_value, port));
+    }
+
+    pub fn bindLocalResult(socket_value: c.SOCKET, port: u16) types.Result(void) {
         var local = localEndpoint(port);
         if (c.bind(socket_value, @ptrCast(&local), @sizeOf(c.SOCKADDR_IN)) != 0) {
-            diagnostics.report("bind(client)", @intCast(c.WSAGetLastError()));
-            return false;
+            return .{ .failure = .{ .stage = "bind(client)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
         }
-        return true;
+        return .{ .success = {} };
     }
 
     pub fn connectUdp(socket_value: c.SOCKET, target: *const c.SOCKADDR_IN) bool {
+        return reportResult(connectUdpResult(socket_value, target));
+    }
+
+    pub fn connectUdpResult(socket_value: c.SOCKET, target: *const c.SOCKADDR_IN) types.Result(void) {
         if (c.connect(socket_value, @ptrCast(target), @sizeOf(c.SOCKADDR_IN)) != 0) {
-            diagnostics.report("connect(UDP client)", @intCast(c.WSAGetLastError()));
-            return false;
+            return .{ .failure = .{ .stage = "connect(UDP client)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
         }
-        return true;
+        return .{ .success = {} };
     }
 
     /// Posts ConnectEx. Null means the operation was accepted, whether it completed inline or is
@@ -996,11 +1040,14 @@ pub const endpoint = struct {
     /// A connected socket only becomes usable for RIO once the accept/connect context has been
     /// updated; the failure is not optional and is reported with the failing stage.
     pub fn updateConnectContext(socket_value: c.SOCKET) bool {
+        return reportResult(updateConnectContextResult(socket_value));
+    }
+
+    pub fn updateConnectContextResult(socket_value: c.SOCKET) types.Result(void) {
         if (c.setsockopt(socket_value, c.SOL_SOCKET, c.SO_UPDATE_CONNECT_CONTEXT, null, 0) != 0) {
-            diagnostics.report("setsockopt(SO_UPDATE_CONNECT_CONTEXT)", @intCast(c.WSAGetLastError()));
-            return false;
+            return .{ .failure = .{ .stage = "setsockopt(SO_UPDATE_CONNECT_CONTEXT)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
         }
-        return true;
+        return .{ .success = {} };
     }
 };
 

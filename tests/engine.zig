@@ -47,17 +47,17 @@ fn buildWorker(
     worker.core.session_count = @intCast(sessions.len);
     worker.core.sessions = sessions;
     worker.transport.slots = slots;
-    for (slots) |*slot| slot.* = .{};
+    for (slots) |*slot| slot.* = .{ .generation = 1 };
     worker.core.steps = steps;
     worker.core.timer_nodes = nodes;
     worker.core.timer_positions = positions;
     worker.core.timers = timer.Heap.init(nodes, positions) catch @panic("timer heap capacity");
-    worker.core.clock = testClock();
-    worker.core.timeout_ticks = worker.core.clock.millisecondsToTicks(5_000);
+    worker.clock = testClock();
+    worker.core.ticks_per_second = worker.clock.frequency;
+    worker.core.timeout_ticks = worker.clock.millisecondsToTicks(5_000);
     for (sessions, 0..) |*entry, index| {
         entry.* = .{};
         entry.index = @intCast(index);
-        entry.generation = 1;
     }
     return worker;
 }
@@ -121,7 +121,7 @@ test "client per-session quota trims the last batch to the remaining grant" {
     var positions: [2]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .echo_count = 17, .pipeline_depth = 8, .session_count = 2 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 4_096);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     const connects = scheduler.start(&worker.core, started, &steps);
     try std.testing.expectEqual(@as(usize, 2), connects.len);
     // The first attempt of a generation is immediate and takes a whole pipeline batch.
@@ -155,10 +155,10 @@ test "client latency sample is one completed batch" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 4 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
-    sessions[0].attempt_started_ticks = started -| worker.core.clock.millisecondsToTicks(2);
+    sessions[0].attempt_started_ticks = started -| worker.clock.millisecondsToTicks(2);
     _ = verifiedEcho(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.latency_samples);
     try std.testing.expect(worker.core.statistics.latency_samples == worker.core.statistics.sampleCount());
@@ -185,6 +185,7 @@ test "client partial RIOSend completion reposts only the unsent tail" {
     sessions[0].state = .active;
     sessions[0].attempt_bytes = 100;
     slots[0].send_outstanding = 1;
+    slots[0].send_posted_bytes = 100;
     sent_offset = 0;
     sent_length = 0;
     const context = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
@@ -194,7 +195,7 @@ test "client partial RIOSend completion reposts only the unsent tail" {
         .SocketContext = null,
         .RequestContext = context,
     });
-    try std.testing.expectEqual(@as(usize, 40), sessions[0].send_offset);
+    try std.testing.expectEqual(@as(u32, 40), slots[0].send_offset);
     // The remainder is re-posted from the same registered window, so the offset moves and the
     // registration does not.
     try std.testing.expectEqual(@as(u32, 40), sent_offset);
@@ -221,17 +222,21 @@ test "client close waits for both posted completions before the generation drain
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
-    worker.core.drain_grace_ticks = worker.core.clock.millisecondsToTicks(5_000);
-    const started = worker.core.clock.nowTicks();
+    worker.core.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
+    const started = worker.clock.nowTicks();
     sessions[0].state = .active;
     sessions[0].requested_echoes = 8;
     slots[0].send_outstanding = 1;
+    slots[0].send_posted_bytes = 128;
     slots[0].receive_outstanding = 1;
+    slots[0].receive_posted_bytes = 128;
     const closing = scheduler.onTransportFailure(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), closing.len);
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
     try std.testing.expectEqual(@as(u64, 8), worker.core.statistics.lost);
     try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.network_errors);
+    var transport = engine.RioAdapter(.tcp){ .transport = &worker.transport, .options = &options, .clock = &worker.clock };
+    _ = transport.close(0);
     // Closing the socket starts cancellation; it does not end the lifetime of the pending I/O, so
     // the generation may not be released until every completion has been dequeued.
     const send_context = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
@@ -256,7 +261,7 @@ test "client close waits for both posted completions before the generation drain
     try std.testing.expectEqual(@as(u64, 8), worker.core.statistics.lost);
 }
 
-test "client stale generation completions never steer the live state machine" {
+test "client closing generation completions never steer the live state machine" {
     var sessions: [1]Session = .{.{}};
     var slots: [1]client.native.transport.Slot = @splat(.{});
     var steps: [3]scheduler.Step = undefined;
@@ -267,9 +272,10 @@ test "client stale generation completions never steer the live state machine" {
     sessions[0].state = .active;
     sessions[0].requested_echoes = 4;
     slots[0].send_outstanding = 1;
-    sessions[0].generation = 3;
-    // A completion whose generation was already retired is still retired from the ledger, but it
-    // must not resume the attempt.
+    slots[0].send_posted_bytes = 16;
+    slots[0].closing = true;
+    // This slot still owns the closing generation; no replacement has been created. Retiring
+    // its real request must not resume an active business snapshot or count cancelled bytes.
     const stale = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
     engine.handleRioResult(.tcp, &worker, .{
         .Status = 0,
@@ -333,14 +339,14 @@ test "client release barrier requires every completion retired" {
     try std.testing.expectEqual(@as(u32, 1), worker.transport.outstanding());
 }
 
-test "client arena registers one send window per slot and one shared receive window" {
+test "client arena registers independent send and receive windows per slot" {
     var winsock = try native.winsock.Winsock.init();
     defer winsock.deinit();
     const extensions = try native.rio.Extensions.load();
     var arena = try native.arena.Arena.create(&extensions.rio, 4, 256);
     defer arena.deinit();
     try std.testing.expectEqual(@as(usize, 4), arena.send_registrations.len);
-    try std.testing.expect(arena.receive_registration.valid());
+    for (arena.receive_registrations) |registration| try std.testing.expect(registration.valid());
     try std.testing.expectEqual(@as(usize, 4 * 256), arena.receive_offset);
     try std.testing.expectEqual(@as(usize, 4 * 256 * 2), arena.bytes);
     // The documented RIOSend contract forbids sharing any part of a registration with another
@@ -350,7 +356,9 @@ test "client arena registers one send window per slot and one shared receive win
         for (arena.send_registrations[index + 1 ..]) |other| {
             try std.testing.expect(registration.id != other.id);
         }
-        try std.testing.expect(registration.id != arena.receive_registration.id);
+        for (arena.receive_registrations) |receive_registration| {
+            try std.testing.expect(registration.id != receive_registration.id);
+        }
     }
     // Views are bounds-checked against the slot stride instead of silently aliasing a neighbour.
     try std.testing.expect(arena.receiveView(3, 256) != null);
@@ -534,8 +542,8 @@ test "a closing generation that never drains is fatal" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
-    worker.core.drain_grace_ticks = worker.core.clock.millisecondsToTicks(5_000);
-    const started = worker.core.clock.nowTicks();
+    worker.core.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
+    const started = worker.clock.nowTicks();
     sessions[0].state = .active;
     sessions[0].requested_echoes = 1;
     // One operation stays in flight, so the generation can never drain on its own.
@@ -560,9 +568,9 @@ test "a reconnect is counted at the failure that triggers it" {
     const options = client.types.Options{ .protocol = .tcp, .reconnect_seconds = 1 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
     worker.core.reconnect_enabled = true;
-    worker.core.reconnect_ticks = worker.core.clock.millisecondsToTicks(1_000);
-    worker.core.drain_grace_ticks = worker.core.clock.millisecondsToTicks(5_000);
-    const started = worker.core.clock.nowTicks();
+    worker.core.reconnect_ticks = worker.clock.millisecondsToTicks(1_000);
+    worker.core.drain_grace_ticks = worker.clock.millisecondsToTicks(5_000);
+    const started = worker.clock.nowTicks();
     sessions[0].state = .active;
     sessions[0].requested_echoes = 4;
     _ = scheduler.onTransportFailure(&worker.core, 0, started, &steps);
@@ -593,7 +601,7 @@ test "a receive completion waits for the send before settling the attempt" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 2 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
 
@@ -620,7 +628,7 @@ test "a receive may complete before the send without posting a second attempt" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 1 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     const initial = scheduler.onConnected(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), countSteps(initial, .send));
@@ -645,7 +653,7 @@ test "a short datagram is corrupted rather than reassembled as stream data" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .udp, .pipeline_depth = 1, .echo_count = 1 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
     _ = scheduler.onSent(&worker.core, 0, started, &steps);
@@ -670,7 +678,7 @@ test "a corrupted receive settles the batch once and continues the quota" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 2, .reconnect_seconds = 1 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
     _ = scheduler.onSent(&worker.core, 0, started, &steps);
@@ -699,7 +707,7 @@ test "a short TCP receive fails the attempt" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 1 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
 
@@ -724,8 +732,8 @@ test "the reconnect wait begins only after the generation has drained" {
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
     // The worker derives both from the options at initialisation; the test builds only the records.
     worker.core.reconnect_enabled = true;
-    worker.core.reconnect_ticks = worker.core.clock.millisecondsToTicks(2_000);
-    const started = worker.core.clock.nowTicks();
+    worker.core.reconnect_ticks = worker.clock.millisecondsToTicks(2_000);
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
 
@@ -735,7 +743,7 @@ test "the reconnect wait begins only after the generation has drained" {
     // Nothing is scheduled while the generation is still in flight.
     try std.testing.expectEqual(@as(u64, 0), sessions[0].reconnect_at_ticks);
 
-    const drained = started +| worker.core.clock.millisecondsToTicks(200);
+    const drained = started +| worker.clock.millisecondsToTicks(200);
     const after_drain = scheduler.onGenerationDrained(&worker.core, 0, drained, &steps);
     try std.testing.expectEqual(@as(usize, 0), after_drain.len);
     try std.testing.expectEqual(client.session.State.reconnecting, sessions[0].state);
@@ -758,7 +766,7 @@ test "a send failure after a receive loses the whole unsettled batch" {
     var positions: [1]u32 = undefined;
     const options = client.types.Options{ .protocol = .tcp, .pipeline_depth = 2, .reconnect_seconds = 0 };
     var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 6);
-    const started = worker.core.clock.nowTicks();
+    const started = worker.clock.nowTicks();
     _ = scheduler.start(&worker.core, started, &steps);
     _ = scheduler.onConnected(&worker.core, 0, started, &steps);
 
