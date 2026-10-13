@@ -43,16 +43,15 @@ pub fn requestStop() void {
 /// accounting.
 pub fn requestFatal() void {
     fatal_requested.store(true, .release);
-    stop_requested.store(true, .release);
 }
 
-fn clearControl() void {
+pub fn clearControl() void {
     stop_requested.store(false, .release);
     fatal_requested.store(false, .release);
 }
 
 fn stopRequested() bool {
-    return stop_requested.load(.acquire);
+    return stop_requested.load(.acquire) or fatalRequested();
 }
 
 fn fatalRequested() bool {
@@ -74,14 +73,16 @@ pub const InitError = error{
 /// The named fail-fast boundaries. Each one is a real production invariant, and naming them keeps
 /// the fault-injection driver exercising the same code path a live run takes.
 pub fn requireNotifySuccess(status: c_int) void {
+    if (status == c.WSAEALREADY) native.diagnostics.failFast("RIONotify duplicate arm", @bitCast(status));
     if (status != c.ERROR_SUCCESS) native.diagnostics.failFast("RIONotify(client)", @bitCast(status));
 }
 
 pub fn requireDequeueCount(count: u32, maximum: u32) u32 {
     // RIO_CORRUPT_CQ is a hard failure rather than "no work".
-    if (count == c.RIO_CORRUPT_CQ or count > maximum) {
+    if (count == c.RIO_CORRUPT_CQ) {
         native.diagnostics.failFast("RIODequeueCompletion(client)", c.ERROR_INVALID_DATA);
     }
+    if (count > maximum) native.diagnostics.failFast("client RIO dequeue extent", c.ERROR_INVALID_DATA);
     return count;
 }
 
@@ -163,7 +164,10 @@ fn resolveTarget(options: *const types.Options, remote: *c.SOCKADDR_IN) bool {
 
 fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options) types.ExitCode {
     internal.worker.trace.configure();
-    clearControl();
+    if (options.session_count == 0 or options.echo_count > std.math.maxInt(u64) / @as(u64, options.session_count)) {
+        native.diagnostics.report("finite echo quota", c.ERROR_ARITHMETIC_OVERFLOW);
+        return .usage;
+    }
     var winsock = native.winsock.Winsock.init() catch return .network;
     defer winsock.deinit();
     // The reference starts Winsock and loads the RIO extensions before it resolves the target, so
@@ -172,15 +176,23 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
     var remote: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
     if (!resolveTarget(options, &remote)) return .network;
     const pattern = payload.build(allocator, options) orelse {
-        native.diagnostics.report("payload build", c.ERROR_INVALID_DATA);
+        native.diagnostics.report("payload pattern", c.ERROR_INVALID_DATA);
         return .usage;
     };
     defer allocator.free(pattern);
     if (!payload.validate(options, pattern)) {
-        native.diagnostics.report("payload validation", c.ERROR_INVALID_DATA);
+        native.diagnostics.report("payload pattern", c.ERROR_INVALID_DATA);
         return .usage;
     }
-    const clock = native.clock.Clock.init() orelse return .internal;
+    const batch_bytes = pattern.len * @as(usize, options.batchCapacity());
+    if (batch_bytes == 0 or batch_bytes > types.maximum_tcp_batch_bytes) {
+        native.diagnostics.report("payload batch size", c.ERROR_ARITHMETIC_OVERFLOW);
+        return .usage;
+    }
+    if (contract.checkedStorageBytes(options.session_count, batch_bytes, options.memory_bytes) == null) {
+        native.diagnostics.report("registered storage /memory limit", c.ERROR_NOT_ENOUGH_MEMORY);
+        return .usage;
+    }
     // Pacing is expressed in milliseconds, so the run asks for the finer wait granularity the
     // reference requests and releases it on every exit path.
     const paced = options.interval_milliseconds != 0;
@@ -192,24 +204,15 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
     defer if (paced) {
         _ = c.timeEndPeriod(1);
     };
-    const batch_bytes = pattern.len * @as(usize, options.batchCapacity());
-    if (batch_bytes == 0 or batch_bytes > types.maximum_tcp_batch_bytes) {
-        native.diagnostics.report("payload batch size", c.ERROR_ARITHMETIC_OVERFLOW);
-        return .usage;
-    }
-    if (contract.checkedStorageBytes(options.session_count, batch_bytes, options.memory_bytes) == null) {
-        native.diagnostics.report("registered storage budget", c.ERROR_NOT_ENOUGH_MEMORY);
-        return .usage;
-    }
     const workers_requested = contract.resolveWorkerCount(options.worker_count, options.session_count);
     const worker_total: u32 = @intCast(workers_requested);
     const base_shard = options.session_count / worker_total;
     const extra_shards = options.session_count % worker_total;
 
-    const workers = allocator.alloc(Worker, worker_total) catch return .internal;
+    const workers = allocator.alloc(Worker, worker_total) catch return .network;
     defer allocator.free(workers);
     for (workers) |*wrk| wrk.* = .{};
-    const snapshots = allocator.alloc(?*Progress, worker_total) catch return .internal;
+    const snapshots = allocator.alloc(?*Progress, worker_total) catch return .network;
     defer {
         for (snapshots) |maybe| {
             if (maybe) |snapshot| allocator.destroy(snapshot);
@@ -226,6 +229,7 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
         const memory_share = (options.memory_bytes / options.session_count) * sessions;
         if (options.report_seconds != 0) {
             const snapshot = allocator.create(Progress) catch {
+                native.diagnostics.report("client worker allocation", c.ERROR_NOT_ENOUGH_MEMORY);
                 setup_failed = true;
                 requestFatal();
                 break;
@@ -233,6 +237,13 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
             snapshot.* = .{};
             snapshots[index] = snapshot;
         }
+        // Frequency initialization belongs to worker setup. Failure follows the same
+        // fatal stop/join/final-accounting path as other setup failures in the baseline.
+        const clock = native.clock.Clock.init() orelse {
+            setup_failed = true;
+            requestFatal();
+            break;
+        };
         switch (initializeWorkerResult(protocol, wrk, &extensions, options, &remote, pattern, batch_bytes, sessions, memory_share, @intCast(index), &clock, snapshots[index])) {
             .success => {},
             .failure => |failure| {
@@ -251,21 +262,19 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
         started = @intCast(index + 1);
     }
 
-    const started_ticks = clock.nowTicks();
-    var next_report_ticks = started_ticks +| clock.millisecondsToTicks(@as(u64, options.report_seconds) * 1_000);
+    // The coordinator uses the baseline's millisecond clock; workers keep QPC ticks
+    // for attempt timing, pacing and native drain deadlines.
+    const started_ms = c.GetTickCount64();
+    var next_report_ms = started_ms +| (@as(u64, options.report_seconds) * 1_000);
     var stop_posts_sent = false;
     while (true) {
-        const now = clock.nowTicks();
+        const now = c.GetTickCount64();
         if (options.run_seconds != 0 and
-            clock.ticksToMilliseconds(now -| started_ticks) >= @as(u64, options.run_seconds) * 1_000)
+            now -| started_ms >= @as(u64, options.run_seconds) * 1_000)
         {
             requestStop();
         }
-        if (stopRequested() and !stop_posts_sent) {
-            for (workers[0..started]) |*wrk| postStop(wrk);
-            stop_posts_sent = true;
-        }
-        if (options.report_seconds != 0 and now >= next_report_ticks) {
+        if (options.report_seconds != 0 and now >= next_report_ms) {
             var merged = metrics.Statistics{};
             var active: u32 = 0;
             for (snapshots[0..started]) |maybe| {
@@ -277,9 +286,13 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
                     active +|= part_active;
                 }
             }
-            merged.elapsed_ms = clock.ticksToMilliseconds(now -| started_ticks);
+            merged.elapsed_ms = now -| started_ms;
             printLine("report", options, &merged, active);
-            next_report_ticks = now +| clock.millisecondsToTicks(@as(u64, options.report_seconds) * 1_000);
+            next_report_ms = now +| (@as(u64, options.report_seconds) * 1_000);
+        }
+        if (stopRequested() and !stop_posts_sent) {
+            for (workers[0..started]) |*wrk| postStop(wrk);
+            stop_posts_sent = true;
         }
         var all_finished = true;
         for (workers[0..started]) |*wrk| {
@@ -304,24 +317,27 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
     // were asked for and never completed, so the classification reports an echo failure even when
     // the terminal cause was a worker or network failure.
     const fatal = statistics.fatal or setup_failed or fatalRequested();
-    const controlled_stop = stopRequested() and !fatal;
-    const unclaimed = statistics.unclaimed(options.echo_count, options.session_count, controlled_stop);
+    // Fatal failure wakes workers too, but only an external stop suppresses the unclaimed
+    // quota. Keep these causes separate when a user stop and setup failure race.
+    const external_stop = stop_requested.load(.acquire);
+    const controlled_stop = external_stop and !fatal;
+    const unclaimed = statistics.unclaimed(options.echo_count, options.session_count, external_stop);
     if (unclaimed != 0) {
-        statistics.lost +|= unclaimed;
-        statistics.attempted +|= unclaimed;
+        statistics.lost +%= unclaimed;
+        statistics.attempted +%= unclaimed;
     }
     if (controlled_stop) {
         // A controlled stop cancels the attempts that were claimed and never finished; they are
         // neither echoes nor losses, which is what the report calls cancelled.
         statistics.cancelled = statistics.attempted -|
-            (statistics.echoes +| statistics.corrupted +| statistics.lost);
+            (statistics.echoes +% statistics.corrupted +% statistics.lost);
     } else if (fatal) {
-        statistics.lost +|= statistics.attempted -|
-            (statistics.echoes +| statistics.corrupted +| statistics.lost +| statistics.cancelled);
+        statistics.lost +%= statistics.attempted -|
+            (statistics.echoes +% statistics.corrupted +% statistics.lost +% statistics.cancelled);
     }
 
     if (options.stats or !options.quiet) {
-        statistics.elapsed_ms = clock.ticksToMilliseconds(clock.nowTicks() -| started_ticks);
+        statistics.elapsed_ms = c.GetTickCount64() -| started_ms;
         printLine("final", options, &statistics, 0);
     }
     printBenchLatency(workers[0..initialized]);
@@ -333,7 +349,7 @@ fn printLine(label: []const u8, options: *const types.Options, statistics: *cons
     var buffer: [1024]u8 = undefined;
     const line = statistics.writeLine(label, options.session_count, active, &buffer) orelse
         native.diagnostics.failFast("client metrics format", c.ERROR_INSUFFICIENT_BUFFER);
-    if (!native.diagnostics.writeStdout(line)) native.diagnostics.failFast("client metrics output", c.GetLastError());
+    _ = native.diagnostics.writeStdout(line);
 }
 
 fn printBenchLatency(workers: []const Worker) void {
@@ -395,6 +411,7 @@ pub fn initializeWorker(
     errdefer wrk.release(allocator);
     wrk.core.index = index;
     wrk.core.session_count = session_count;
+    wrk.core.live_sessions = session_count;
     wrk.core.options = options;
     wrk.clock = clock.*;
     wrk.core.ticks_per_second = clock.frequency;
@@ -409,22 +426,22 @@ pub fn initializeWorker(
     wrk.core.drain_grace_ticks = clock.millisecondsToTicks(internal.drain_grace_milliseconds);
     wrk.core.reconnect_ticks = if (options.reconnect_seconds) |seconds| clock.millisecondsToTicks(@as(u64, seconds) * 1_000) else 0;
     if (clock.frequency == 0) return initializationError(wrk, error.Clock, .{
-        .stage = "QueryPerformanceFrequency(client)",
+        .stage = "QueryPerformanceFrequency",
         .native_code = c.ERROR_INVALID_DATA,
         .domain = .invariant,
     });
 
-    const arena_bytes = contract.checkedStorageBytes(session_count, batch_bytes, memory_share) orelse {
-        return initializationError(wrk, error.Capacity, .{ .stage = "client worker arena budget", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .capacity });
-    };
-    if (options.cq_capacity < session_count * 2 or arena_bytes > std.math.maxInt(u32)) {
-        return initializationError(wrk, error.Capacity, .{ .stage = "client worker completion queue capacity", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .capacity });
-    }
     wrk.transport.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
     if (wrk.transport.port.value == null or wrk.transport.port.value == c.INVALID_HANDLE_VALUE) {
         return initializationError(wrk, error.Port, .{ .stage = "CreateIoCompletionPort(client worker)", .native_code = c.GetLastError(), .domain = .win32 });
     }
     if (injectedFailure(.port)) return initializationError(wrk, error.Port, .{ .stage = "client injected port failure", .native_code = c.ERROR_INVALID_STATE, .domain = .invariant });
+    const arena_bytes = contract.checkedStorageBytes(session_count, batch_bytes, memory_share) orelse {
+        return initializationError(wrk, error.Capacity, .{ .stage = "client worker IOCP/CQ/arena capacity", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .capacity });
+    };
+    if (options.cq_capacity < session_count * 2 or arena_bytes > std.math.maxInt(u32)) {
+        return initializationError(wrk, error.Capacity, .{ .stage = "client worker IOCP/CQ/arena capacity", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .capacity });
+    }
     const stride: u32 = @intCast(batch_bytes);
     wrk.transport.arena = switch (native.arena.Arena.createResult(&extensions.rio, session_count, stride)) {
         .success => |arena| arena,
@@ -435,20 +452,20 @@ pub fn initializeWorker(
         const window = wrk.transport.arena.sendBytes(@intCast(slot), stride) orelse return initializationError(wrk, error.Arena, .{ .stage = "client send window", .native_code = c.ERROR_INVALID_DATA, .domain = .invariant });
         payload.fillRepeated(window, pattern);
     }
-    wrk.core.sessions = allocator.alloc(Session, session_count) catch return initializationError(wrk, error.Sessions, .{ .stage = "client worker sessions allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
+    wrk.core.sessions = allocator.alloc(Session, session_count) catch return initializationError(wrk, error.Sessions, .{ .stage = "client worker allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
     for (wrk.core.sessions, 0..) |*entry, position| {
         entry.* = .{};
         entry.index = @intCast(position);
     }
     if (injectedFailure(.sessions)) return initializationError(wrk, error.Sessions, .{ .stage = "client injected sessions failure", .native_code = c.ERROR_INVALID_STATE, .domain = .invariant });
-    wrk.core.steps = allocator.alloc(Step, internal.stepRegionBytes(session_count) * internal.step_levels) catch return initializationError(wrk, error.Sessions, .{ .stage = "client worker actions allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
-    wrk.core.timer_nodes = allocator.alloc(internal.timer.Node, session_count) catch return initializationError(wrk, error.TimerNodes, .{ .stage = "client worker timer nodes allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
+    wrk.core.steps = allocator.alloc(Step, internal.stepRegionBytes(session_count) * internal.step_levels) catch return initializationError(wrk, error.Sessions, .{ .stage = "client worker allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
+    wrk.core.timer_nodes = allocator.alloc(internal.timer.Node, session_count) catch return initializationError(wrk, error.TimerNodes, .{ .stage = "client worker allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
     if (injectedFailure(.timer_nodes)) return initializationError(wrk, error.TimerNodes, .{ .stage = "client injected timer nodes failure", .native_code = c.ERROR_INVALID_STATE, .domain = .invariant });
-    wrk.core.timer_positions = allocator.alloc(u32, session_count) catch return initializationError(wrk, error.TimerPositions, .{ .stage = "client worker timer positions allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
+    wrk.core.timer_positions = allocator.alloc(u32, session_count) catch return initializationError(wrk, error.TimerPositions, .{ .stage = "client worker allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
     if (injectedFailure(.timer_positions)) return initializationError(wrk, error.TimerPositions, .{ .stage = "client injected timer positions failure", .native_code = c.ERROR_INVALID_STATE, .domain = .invariant });
     wrk.core.timers = internal.timer.Heap.init(wrk.core.timer_nodes, wrk.core.timer_positions) catch return initializationError(wrk, error.TimerHeap, .{ .stage = "client timer heap initialization", .native_code = c.ERROR_INVALID_DATA, .domain = .invariant });
     if (injectedFailure(.timer_heap)) return initializationError(wrk, error.TimerHeap, .{ .stage = "client injected timer heap failure", .native_code = c.ERROR_INVALID_STATE, .domain = .invariant });
-    wrk.transport.slots = allocator.alloc(native.transport.Slot, session_count) catch return initializationError(wrk, error.Sessions, .{ .stage = "client worker transport slots allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
+    wrk.transport.slots = allocator.alloc(native.transport.Slot, session_count) catch return initializationError(wrk, error.Sessions, .{ .stage = "client worker allocation", .native_code = c.ERROR_NOT_ENOUGH_MEMORY, .domain = .allocation });
     for (wrk.transport.slots) |*slot| slot.* = .{};
     var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
     notification.Type = c.RIO_IOCP_COMPLETION;
@@ -532,7 +549,7 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
             const region = self.core.acquireRegion();
             if (region.len == 0) return;
             defer self.core.releaseRegion();
-            const actions = self.core.onEvent(event, self.clock.nowTicks(), region);
+            const actions = self.core.onEventWithClock(event, self.clock, region);
             self.dispatch(actions);
         }
 
@@ -592,6 +609,10 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
                 };
                 if (failed_session == index) continue;
                 internal.worker.trace.eventArgs("STEP", "step={s}", .{@tagName(action)});
+                switch (action) {
+                    .receive => internal.session.scheduler.anchorAttemptStarted(self.core, index, self.clock.nowTicks()),
+                    else => {},
+                }
                 const result = switch (action) {
                     .connect => self.transport.connect(index),
                     .send => |value| self.transport.send(index, value.bytes),
@@ -665,14 +686,22 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
             }
         }
 
-        pub fn shutdown(self: *Self) void {
+        /// A stop packet settles business accounting and starts native cancellation immediately.
+        /// Repeated packets and the final shutdown share this idempotent entry point.
+        pub fn beginStop(self: *Self) void {
+            if (self.core.stopping) return;
             if (fatalRequested()) self.core.markFatal();
             internal.session.scheduler.beginShutdownAt(self.core, self.clock.nowTicks());
             if (self.owner) |owner| owner.publish(self.clock.nowTicks(), true);
             for (self.core.sessions) |entry| {
+                if (entry.state == .done) continue;
                 const action = [_]internal.worker.Action{.{ .close = entry.index }};
                 self.dispatch(&action);
             }
+        }
+
+        pub fn shutdown(self: *Self) void {
+            self.beginStop();
             // Each generation retains its first close deadline. Stop must not grant a second
             // grace period to a generation that was already cancelling before the stop arrived.
             while (self.transport.outstanding() != 0) {
@@ -782,14 +811,19 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
             slot.generation = native.completion.nextGeneration(slot.generation);
             slot.socket.reset(native.socket.registered(socketType(protocol), ipProtocol(protocol)));
             if (slot.socket.value == c.INVALID_SOCKET) return .{ .failure = .{
-                .stage = "WSASocketW(client)",
+                .stage = "client socket creation",
                 .native_code = @bitCast(c.WSAGetLastError()),
                 .domain = .winsock,
                 .category = .connection,
             } };
             switch (native.socket.configureResult(slot.socket.value, self.options.socket_buffer_bytes, protocol == .tcp)) {
                 .success => {},
-                .failure => |failure| return .{ .failure = failure },
+                .failure => |failure| {
+                    native.diagnostics.report(failure.stage, failure.native_code);
+                    var creation_failure = failure;
+                    creation_failure.stage = "client socket creation";
+                    return .{ .failure = creation_failure };
+                },
             }
             switch (native.endpoint.bindLocalResult(slot.socket.value, self.options.local_port)) {
                 .success => {},
@@ -802,7 +836,12 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 }
                 switch (self.createRequestQueue(index)) {
                     .success => {},
-                    .failure => |failure| return .{ .failure = failure },
+                    .failure => |failure| {
+                        native.diagnostics.report(failure.stage, failure.native_code);
+                        var connection_failure = failure;
+                        connection_failure.stage = "connect/RQ(UDP client)";
+                        return .{ .failure = connection_failure };
+                    },
                 }
                 return .{ .success = .{ .posted_at = self.clock.nowTicks(), .completion = .{
                     .index = index,
@@ -827,6 +866,7 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 slot.connect_outstanding = false;
                 return .{ .failure = .{ .stage = "ConnectEx", .native_code = @bitCast(code), .domain = .winsock, .category = .connection } };
             }
+            self.transport.total_outstanding += 1;
             return .{ .success = .{ .posted_at = at } };
         }
 
@@ -845,6 +885,9 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 .category = .connection,
             } };
             slot.send_outstanding = 1;
+            self.transport.rio_outstanding += 1;
+            self.transport.total_outstanding += 1;
+            self.maybeArm();
             return .{ .success = {} };
         }
 
@@ -874,6 +917,9 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
             } };
             slot.receive_posted_bytes = bytes;
             slot.receive_outstanding = 1;
+            self.transport.rio_outstanding += 1;
+            self.transport.total_outstanding += 1;
+            self.maybeArm();
             return .{ .success = .{} };
         }
 
@@ -904,12 +950,15 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                     if (slot.send_outstanding != 1 or slot.send_posted_bytes == 0 or slot.send_offset >= slot.send_posted_bytes) native.diagnostics.failFast("client send completion accounting", c.ERROR_INVALID_DATA);
                     const remaining = slot.send_posted_bytes - slot.send_offset;
                     if (bytes > remaining) native.diagnostics.failFast("client completion exceeds posted range", c.ERROR_INVALID_DATA);
+                    if (self.transport.rio_outstanding == 0 or self.transport.total_outstanding == 0) native.diagnostics.failFast("client RIO outstanding count", c.ERROR_INVALID_DATA);
                     slot.send_outstanding = 0;
+                    self.transport.rio_outstanding -= 1;
+                    self.transport.total_outstanding -= 1;
                     if (!slot.closing and status == 0) {
                         if (bytes == 0) {
                             status = native.completion.wsa_econnreset;
                         } else {
-                            self.transport.sent_bytes +|= bytes;
+                            self.transport.sent_bytes +%= bytes;
                             slot.send_offset += bytes;
                             if (slot.send_offset < slot.send_posted_bytes) {
                                 switch (self.sendTail(decoded.index)) {
@@ -929,7 +978,10 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 .receive => {
                     if (slot.receive_outstanding != 1 or slot.receive_posted_bytes == 0) native.diagnostics.failFast("client receive completion accounting", c.ERROR_INVALID_DATA);
                     if (bytes > slot.receive_posted_bytes) native.diagnostics.failFast("client completion exceeds posted range", c.ERROR_INVALID_DATA);
+                    if (self.transport.rio_outstanding == 0 or self.transport.total_outstanding == 0) native.diagnostics.failFast("client RIO outstanding count", c.ERROR_INVALID_DATA);
                     slot.receive_outstanding = 0;
+                    self.transport.rio_outstanding -= 1;
+                    self.transport.total_outstanding -= 1;
                     slot.receive_posted_bytes = 0;
                 },
                 .connect, .generation_drained => native.diagnostics.failFast("client RIO completion operation", c.ERROR_INVALID_DATA),
@@ -940,8 +992,9 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
 
         fn retireConnect(self: *Self, index: u32, ok: bool, native_error: u32) ?internal.worker.Completion {
             const slot = self.slotAt(index);
-            if (!slot.connect_outstanding) native.diagnostics.failFast("ConnectEx outstanding count", c.ERROR_INVALID_DATA);
+            if (!slot.connect_outstanding or self.transport.total_outstanding == 0) native.diagnostics.failFast("ConnectEx outstanding count", c.ERROR_INVALID_DATA);
             slot.connect_outstanding = false;
+            self.transport.total_outstanding -= 1;
             if (slot.closing) return self.drainCompletion(index);
             if (!ok) native.diagnostics.report("ConnectEx completion", native_error);
             return .{ .index = index, .generation = slot.generation, .slot = native.completion.no_send_slot, .operation = .connect, .status = if (ok) 0 else @bitCast(native_error), .bytes = 0 };
@@ -960,18 +1013,14 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
         }
 
         pub fn maybeArm(self: *Self) void {
-            if (self.transport.completion_queue.armed) return;
-            var rio_outstanding: u32 = 0;
-            for (self.transport.slots) |slot| rio_outstanding += slot.send_outstanding + slot.receive_outstanding;
-            if (rio_outstanding == 0) return;
+            if (self.transport.completion_queue.armed or self.transport.rio_outstanding == 0) return;
             requireNotifySuccess(self.transport.api.?.notify(self.transport.completion_queue.value));
             requireNotificationRearmed(&self.transport.completion_queue.armed);
-            self.transport.notification_arms +|= 1;
+            self.transport.notification_arms +%= 1;
         }
 
         pub fn waitAndDrain(self: *Self, wait_ms: u32, runtime: anytype) void {
             _ = self.consumePacket(wait_ms, runtime);
-            self.drain(drain_batches, runtime);
         }
 
         /// Each slot owns at most one ConnectEx packet or two RIO operations; notification and
@@ -987,6 +1036,7 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
             // deadline pass into more than the fixed ownership capacity worth of completions.
             const rio_budget: u32 = @intCast(self.transport.slots.len * 2);
             self.drainRecords(rio_budget, runtime);
+            self.maybeArm();
         }
 
         fn drainRecords(self: *Self, budget: u32, runtime: anytype) void {
@@ -1015,14 +1065,21 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 if (ok == c.FALSE) native.diagnostics.failFast("GetQueuedCompletionStatus(client notification)", code);
                 if (key != @intFromPtr(self.transport.notification_owner.?)) native.diagnostics.failFast("client RIO notification key", c.ERROR_INVALID_DATA);
                 requireNotificationDelivered(&self.transport.completion_queue.armed);
-                self.transport.notification_deliveries +|= 1;
+                self.transport.notification_deliveries +%= 1;
+                // Complete this notification's bounded CQ pass before acquiring another packet.
+                // In particular notification -> stop must settle echoes before cancellation.
+                self.drain(drain_batches, runtime);
+                self.maybeArm();
             } else if (overlapped == null) {
                 if (ok == c.FALSE) {
                     if (code != c.WAIT_TIMEOUT) native.diagnostics.failFast("GetQueuedCompletionStatus(client)", code);
-                    if (self.outstanding() != 0) self.transport.timeout_wakeups_while_outstanding +|= 1;
+                    if (!runtime.core.stopping and self.transport.rio_outstanding != 0 and !self.transport.completion_queue.armed) self.transport.timeout_wakeups_while_outstanding +%= 1;
+                    if (stopRequested()) runtime.beginStop();
                     return false;
                 } else if (key != stop_key) {
                     native.diagnostics.failFast("unexpected client IOCP packet", c.ERROR_INVALID_DATA);
+                } else {
+                    runtime.beginStop();
                 }
             } else {
                 if (key == 0 or key > self.transport.slots.len) native.diagnostics.failFast("unexpected ConnectEx completion key", c.ERROR_INVALID_DATA);
@@ -1032,6 +1089,7 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 if (transferred != 0) native.diagnostics.failFast("ConnectEx completion exceeds posted range", c.ERROR_INVALID_DATA);
                 if (self.retireConnect(index, ok != c.FALSE, code)) |completion| runtime.handleCompletion(completion);
             }
+            if (stopRequested()) runtime.beginStop();
             return true;
         }
 
@@ -1053,7 +1111,7 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
                 if (overlapped == &self.transport.notification_overlapped) {
                     if (key != @intFromPtr(self.transport.notification_owner.?)) native.diagnostics.failFast("client RIO notification key", c.ERROR_INVALID_DATA);
                     requireNotificationDelivered(&self.transport.completion_queue.armed);
-                    self.transport.notification_deliveries +|= 1;
+                    self.transport.notification_deliveries +%= 1;
                 } else if (overlapped != null or key != stop_key) {
                     native.diagnostics.failFast("unexpected client retirement packet", c.ERROR_INVALID_DATA);
                 }

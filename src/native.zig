@@ -38,6 +38,7 @@ pub const sdk = struct {
         pub const INADDR_ANY: u32 = 0;
         pub const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
         pub const WSA_FLAG_REGISTERED_IO: DWORD = 0x100;
+        pub const WSAEALREADY: c_int = 10037;
         pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000006;
         pub const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000024;
         pub const RIO_MSG_WAITALL: DWORD = 0x00000004;
@@ -258,7 +259,7 @@ pub const diagnostics = struct {
 
     pub fn report(stage: []const u8, native_error: u32) void {
         var buffer: [512]u8 = undefined;
-        const output = std.fmt.bufPrint(&buffer, "{s} failed: native_error={d}\n", .{ stage, native_error }) catch return;
+        const output = std.fmt.bufPrint(&buffer, "{s} failed: native_error={d}\n", .{ stage, @as(i32, @bitCast(native_error)) }) catch return;
         _ = writeStderr(output);
     }
 
@@ -280,7 +281,7 @@ pub const winsock = struct {
             var data: c.WSADATA = undefined;
             const status = c.WSAStartup(0x0202, &data);
             if (status != 0) {
-                diagnostics.report("WSAStartup", @intCast(status));
+                diagnostics.report("WSAStartup", @bitCast(status));
                 return error.WsaStartup;
             }
             return .{ .started = true };
@@ -463,7 +464,7 @@ pub const arena = struct {
         /// Captures the failing API's code before rollback can change thread-local last-error.
         pub fn createResult(api: *const rio.Api, slots: u32, stride: u32) types.Result(Arena) {
             const bytes = workerBytes(slots, stride) orelse return .{ .failure = .{
-                .stage = "client worker arena budget",
+                .stage = "client worker IOCP/CQ/arena capacity",
                 .native_code = c.ERROR_NOT_ENOUGH_MEMORY,
                 .domain = .capacity,
             } };
@@ -471,7 +472,7 @@ pub const arena = struct {
             var transferred = false;
             defer if (!transferred) result.deinit();
             result.pages = VirtualMemory.alloc(bytes) catch return .{ .failure = .{
-                .stage = "VirtualAlloc(worker arena)",
+                .stage = "VirtualAlloc(client arena)",
                 .native_code = c.GetLastError(),
                 .domain = .win32,
             } };
@@ -634,15 +635,19 @@ pub const rio = struct {
             var probe = socket.Socket{ .value = socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP) };
             defer probe.deinit();
             if (probe.value == c.INVALID_SOCKET) {
-                diagnostics.report("WSASocketW(RIO probe)", @intCast(c.WSAGetLastError()));
+                diagnostics.report("WSASocketW(RIO probe)", @bitCast(c.WSAGetLastError()));
                 return error.ProbeSocket;
             }
+            return loadFromSocket(probe.value);
+        }
+
+        fn loadFromSocket(probe: c.SOCKET) !Api {
             var table: c.RIO_EXTENSION_FUNCTION_TABLE = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE);
             table.cbSize = @intCast(@sizeOf(c.RIO_EXTENSION_FUNCTION_TABLE));
             var identifier: c.GUID = c.WSAID_MULTIPLE_RIO;
             var returned: c.DWORD = 0;
             const status = c.WSAIoctl(
-                probe.value,
+                probe,
                 c.SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
                 &identifier,
                 @intCast(@sizeOf(c.GUID)),
@@ -653,7 +658,7 @@ pub const rio = struct {
                 null,
             );
             if (status != 0) {
-                diagnostics.report("SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)", @intCast(c.WSAGetLastError()));
+                diagnostics.report("SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)", @bitCast(c.WSAGetLastError()));
                 return error.LoadRio;
             }
             if (!tableComplete(&table)) return error.InvalidRioTable;
@@ -712,13 +717,13 @@ pub const rio = struct {
         connect_ex: ?c.LPFN_CONNECTEX,
 
         pub fn load() !Extensions {
-            const api = try Api.load();
             var probe = socket.Socket{ .value = socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP) };
             defer probe.deinit();
             if (probe.value == c.INVALID_SOCKET) {
-                diagnostics.report("WSASocketW(ConnectEx probe)", @intCast(c.WSAGetLastError()));
+                diagnostics.report("WSASocketW(RIO probe)", @bitCast(c.WSAGetLastError()));
                 return error.ProbeSocket;
             }
+            const api = try Api.loadFromSocket(probe.value);
             var identifier = c.WSAID_CONNECTEX;
             var connect_ex: ?c.LPFN_CONNECTEX = null;
             var returned: c.DWORD = 0;
@@ -733,7 +738,7 @@ pub const rio = struct {
                 null,
                 null,
             ) != 0 or connect_ex == null) {
-                diagnostics.report("SIO_GET_EXTENSION_FUNCTION_POINTER(ConnectEx)", @intCast(c.WSAGetLastError()));
+                diagnostics.report("SIO_GET_EXTENSION_FUNCTION_POINTER(ConnectEx)", @bitCast(c.WSAGetLastError()));
                 return error.LoadConnectEx;
             }
             return .{ .rio = api, .connect_ex = connect_ex };
@@ -981,14 +986,14 @@ pub const endpoint = struct {
         for (digits, 0..) |character, index| service[index] = character;
         var hints: c.ADDRINFOW = std.mem.zeroes(c.ADDRINFOW);
         hints.ai_family = c.AF_INET;
-        hints.ai_socktype = c.SOCK_STREAM;
+        hints.ai_socktype = 0;
         var results: [*c]c.ADDRINFOW = null;
         const status = c.GetAddrInfoW(host, @ptrCast(&service), &hints, &results);
+        defer if (results != null) c.FreeAddrInfoW(results);
         if (status != 0 or results == null) {
-            diagnostics.report("GetAddrInfoW(IPv4)", @intCast(status));
+            diagnostics.report("GetAddrInfoW(IPv4)", @bitCast(status));
             return null;
         }
-        defer c.FreeAddrInfoW(results);
         return (@as(*const c.SOCKADDR_IN, @ptrCast(@alignCast(results.*.ai_addr)))).*;
     }
 
@@ -1018,7 +1023,7 @@ pub const endpoint = struct {
 
     pub fn connectUdpResult(socket_value: c.SOCKET, target: *const c.SOCKADDR_IN) types.Result(void) {
         if (c.connect(socket_value, @ptrCast(target), @sizeOf(c.SOCKADDR_IN)) != 0) {
-            return .{ .failure = .{ .stage = "connect(UDP client)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
+            return .{ .failure = .{ .stage = "connect/RQ(UDP client)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
         }
         return .{ .success = {} };
     }
@@ -1045,7 +1050,7 @@ pub const endpoint = struct {
 
     pub fn updateConnectContextResult(socket_value: c.SOCKET) types.Result(void) {
         if (c.setsockopt(socket_value, c.SOL_SOCKET, c.SO_UPDATE_CONNECT_CONTEXT, null, 0) != 0) {
-            return .{ .failure = .{ .stage = "setsockopt(SO_UPDATE_CONNECT_CONTEXT)", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
+            return .{ .failure = .{ .stage = "ConnectEx completion", .native_code = @bitCast(c.WSAGetLastError()), .domain = .winsock, .category = .connection } };
         }
         return .{ .success = {} };
     }
@@ -1060,7 +1065,7 @@ pub const clock = struct {
         pub fn init() ?Clock {
             var value: c.LARGE_INTEGER = .{ .QuadPart = 0 };
             if (c.QueryPerformanceFrequency(&value) == c.FALSE or value.QuadPart <= 0) {
-                diagnostics.report("QueryPerformanceFrequency(client timer)", c.GetLastError());
+                diagnostics.report("QueryPerformanceFrequency", c.GetLastError());
                 return null;
             }
             const clock_value = Clock{ .frequency = @intCast(value.QuadPart) };

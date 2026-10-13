@@ -45,6 +45,7 @@ fn buildWorker(
     worker.core.options = options;
     worker.core.payload_bytes = payload_bytes;
     worker.core.session_count = @intCast(sessions.len);
+    worker.core.live_sessions = @intCast(sessions.len);
     worker.core.sessions = sessions;
     worker.transport.slots = slots;
     for (slots) |*slot| slot.* = .{ .generation = 1 };
@@ -91,6 +92,8 @@ test "client RIO notification drains its queue before one rearm" {
     worker.transport.api = &api;
     worker.transport.completion_queue = .{ .api = &api, .value = @as(c.RIO_CQ, @ptrFromInt(0x1000)), .armed = false };
     slots[0].receive_outstanding = 1;
+    worker.transport.rio_outstanding = 1;
+    worker.transport.total_outstanding = 1;
     notification_trace_len = 0;
     // The queue is only armed while work is in flight.
     engine.maybeArm(&worker);
@@ -107,6 +110,8 @@ test "client RIO notification drains its queue before one rearm" {
     // With nothing outstanding the queue stays unarmed, which is what keeps a notification from
     // outliving the work it describes.
     slots[0].receive_outstanding = 0;
+    worker.transport.rio_outstanding = 0;
+    worker.transport.total_outstanding = 0;
     engine.requireNotificationDelivered(&worker.transport.completion_queue.armed);
     engine.maybeArm(&worker);
     try std.testing.expectEqualStrings("NDN", notification_trace[0..notification_trace_len]);
@@ -186,6 +191,11 @@ test "client partial RIOSend completion reposts only the unsent tail" {
     sessions[0].attempt_bytes = 100;
     slots[0].send_outstanding = 1;
     slots[0].send_posted_bytes = 100;
+    worker.transport.rio_outstanding = 1;
+    worker.transport.total_outstanding = 1;
+    // The injected completion bypasses the notification delivery helper. The original accepted
+    // send has already armed its queue, so reposting its tail must not arm an absent native CQ.
+    worker.transport.completion_queue.armed = true;
     sent_offset = 0;
     sent_length = 0;
     const context = native.completion.encode(0, 1, native.completion.no_send_slot, .send).?;
@@ -230,6 +240,8 @@ test "client close waits for both posted completions before the generation drain
     slots[0].send_posted_bytes = 128;
     slots[0].receive_outstanding = 1;
     slots[0].receive_posted_bytes = 128;
+    worker.transport.rio_outstanding = 2;
+    worker.transport.total_outstanding = 2;
     const closing = scheduler.onTransportFailure(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), closing.len);
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
@@ -273,6 +285,8 @@ test "client closing generation completions never steer the live state machine" 
     sessions[0].requested_echoes = 4;
     slots[0].send_outstanding = 1;
     slots[0].send_posted_bytes = 16;
+    worker.transport.rio_outstanding = 1;
+    worker.transport.total_outstanding = 1;
     slots[0].closing = true;
     // This slot still owns the closing generation; no replacement has been created. Retiring
     // its real request must not resume an active business snapshot or count cancelled bytes.
@@ -336,6 +350,8 @@ test "client release barrier requires every completion retired" {
     try std.testing.expect(sessions[0].isFinished());
     // The named boundary itself is exercised by the fault driver, which must terminate the process.
     slots[0].receive_outstanding = 1;
+    worker.transport.rio_outstanding = 1;
+    worker.transport.total_outstanding = 1;
     try std.testing.expectEqual(@as(u32, 1), worker.transport.outstanding());
 }
 
@@ -548,6 +564,8 @@ test "a closing generation that never drains is fatal" {
     sessions[0].requested_echoes = 1;
     // One operation stays in flight, so the generation can never drain on its own.
     slots[0].receive_outstanding = 1;
+    worker.transport.rio_outstanding = 1;
+    worker.transport.total_outstanding = 1;
     const closing = scheduler.onTransportFailure(&worker.core, 0, started, &steps);
     try std.testing.expectEqual(@as(usize, 1), closing.len);
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);

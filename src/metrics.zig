@@ -42,21 +42,21 @@ pub const Statistics = struct {
     elapsed_ms: u64 = 0,
 
     pub fn merge(self: *Statistics, other: *const Statistics) void {
-        self.echoes +|= other.echoes;
-        self.sent_bytes +|= other.sent_bytes;
-        self.received_bytes +|= other.received_bytes;
-        self.bytes +|= other.bytes;
-        self.corrupted +|= other.corrupted;
-        self.lost +|= other.lost;
-        self.attempted +|= other.attempted;
-        self.cancelled +|= other.cancelled;
-        self.connections +|= other.connections;
-        self.reconnects +|= other.reconnects;
-        self.network_errors +|= other.network_errors;
+        self.echoes +%= other.echoes;
+        self.sent_bytes +%= other.sent_bytes;
+        self.received_bytes +%= other.received_bytes;
+        self.bytes +%= other.bytes;
+        self.corrupted +%= other.corrupted;
+        self.lost +%= other.lost;
+        self.attempted +%= other.attempted;
+        self.cancelled +%= other.cancelled;
+        self.connections +%= other.connections;
+        self.reconnects +%= other.reconnects;
+        self.network_errors +%= other.network_errors;
         self.fatal = self.fatal or other.fatal;
-        for (&self.latency_bins, other.latency_bins) |*target, source| target.* +|= source;
-        self.latency_samples +|= other.latency_samples;
-        self.latency_sum_us +|= other.latency_sum_us;
+        for (&self.latency_bins, other.latency_bins) |*target, source| target.* +%= source;
+        self.latency_samples +%= other.latency_samples;
+        self.latency_sum_us +%= other.latency_sum_us;
         self.latency_max_us = @max(self.latency_max_us, other.latency_max_us);
         self.elapsed_ms = @max(self.elapsed_ms, other.elapsed_ms);
     }
@@ -66,16 +66,16 @@ pub const Statistics = struct {
     /// matching the reference's tick conversion.
     pub fn recordLatency(self: *Statistics, micros: u64) void {
         const value = @max(@as(u64, 1), micros);
-        self.latency_samples +|= 1;
-        self.latency_sum_us +|= value;
+        self.latency_samples +%= 1;
+        self.latency_sum_us +%= value;
         self.latency_max_us = @max(self.latency_max_us, value);
         const band: usize = 63 - @as(usize, @clz(value));
-        self.latency_bins[@min(band, latency_buckets - 1)] +|= 1;
+        self.latency_bins[@min(band, latency_buckets - 1)] +%= 1;
     }
 
     pub fn sampleCount(self: *const Statistics) u64 {
         var total: u64 = 0;
-        for (self.latency_bins) |count| total +|= count;
+        for (self.latency_bins) |count| total +%= count;
         return total;
     }
 
@@ -88,7 +88,7 @@ pub const Statistics = struct {
         if (target == 0) return 0;
         var seen: u64 = 0;
         for (self.latency_bins, 0..) |count, index| {
-            seen +|= count;
+            seen +%= count;
             if (seen >= target) return @as(u64, 1) << @intCast(@min(index, 63));
         }
         return 0;
@@ -111,10 +111,10 @@ pub const Statistics = struct {
 
     pub fn terminalCount(self: *const Statistics) u64 {
         var total: u64 = 0;
-        total +|= self.echoes;
-        total +|= self.corrupted;
-        total +|= self.lost;
-        total +|= self.cancelled;
+        total +%= self.echoes;
+        total +%= self.corrupted;
+        total +%= self.lost;
+        total +%= self.cancelled;
         return total;
     }
 
@@ -151,7 +151,8 @@ pub const Statistics = struct {
         active: u32,
         buffer: []u8,
     ) ?[]const u8 {
-        return std.fmt.bufPrint(buffer,
+        return std.fmt.bufPrint(
+            buffer,
             "{s} elapsed_ms={d} sessions={d} active={d} attempted={d} pending={d} echoed={d} corrupted={d} lost={d} cancelled={d} sent_bytes={d} received_bytes={d} bytes={d} connections={d} reconnects={d} network_errors={d} echo_per_sec={d:.2} MiB_per_sec={d:.2} p50_us~{d} p99_us~{d} p999_us~{d} mean_us={d} max_us~{d} latency_sample=batch\n",
             .{
                 label,

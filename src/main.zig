@@ -21,27 +21,23 @@ fn consoleHandler(kind: c.DWORD) callconv(.winapi) c.BOOL {
 }
 
 pub fn main(init: std.process.Init) u8 {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
     var error_buffer: [types.error_capacity]u8 = @splat(0);
     var options: types.Options = undefined;
     // A malformed command line reports the diagnostic and the usage on stderr, leaving stdout
     // empty, which is what the process tests read.
-    if (!contract.parseProcessArgs(init.minimal.args, arena_state.allocator(), &options, &error_buffer)) {
+    if (!contract.parseProcessArgs(init.minimal.args, &options, &error_buffer)) {
         std.debug.print("Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)});
         std.debug.print("{s}", .{contract.usage});
         return @backingInt(types.ExitCode.usage);
     }
     // A valid help command line prints the usage on stdout and never starts the transport.
     if (options.help) {
-        if (!native.diagnostics.writeStdout(contract.usage)) {
-            native.diagnostics.report("client help output", c.GetLastError());
-            return @backingInt(types.ExitCode.internal);
-        }
+        _ = native.diagnostics.writeStdout(contract.usage);
         return @backingInt(types.ExitCode.success);
     }
+    engine.clearControl();
     if (c.SetConsoleCtrlHandler(consoleHandler, c.TRUE) == c.FALSE) {
-        native.diagnostics.report("SetConsoleCtrlHandler", c.GetLastError());
+        std.debug.print("SetConsoleCtrlHandler failed: {d}\n", .{c.GetLastError()});
         return @backingInt(types.ExitCode.internal);
     }
     defer _ = c.SetConsoleCtrlHandler(consoleHandler, c.FALSE);

@@ -35,11 +35,13 @@ pub const tokens = struct {
 
 /// Usage text, printed on stdout for a valid help command line and on stderr for a usage error.
 pub const usage =
-    "Usage: zig-echo-client target /p tcp|udp [/r port] [/l port] [/n count]\n" ++
-    "       [/t seconds] [/i ms] [/d text | /z bytes | /zt bytes] [/k tcp-depth]\n" ++
-    "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]\n" ++
-    "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
-    "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n";
+    "Usage: zig-echo-client target /p tcp|udp [/r port] [/l port] [/n count] [/t seconds] [/i ms]\n       [/d " ++
+    "text | /z bytes | /zt bytes] [/k depth] [/c sessions]\n       [/threads workers] [/w seconds] [/rc " ++
+    "[seconds]] [/report seconds]\n       [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]\n/n " ++
+    "count: attempts per session; 0 means unlimited.\n/k depth: TCP requests in flight per session; UDP " ++
+    "rejects /k.\n/threads 0: automatic workers, min(sessions, active processors, 64).\n/rc [seconds]: " ++
+    "reconnect after failure; bare /rc means 1 second.\n/w 0: no run limit. /report 0: no periodic " ++
+    "reports.\n/q suppresses the default final; /stats forces final; /h shows help.\n";
 
 /// Which protocol a switch belongs to; the parser rejects a switch used with the wrong one.
 pub const Scope = enum { both, tcp_only, udp_only };
@@ -452,14 +454,30 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
     return true;
 }
 
-pub fn parseProcessArgs(args: std.process.Args, allocator: std.mem.Allocator, out: *types.Options, error_buffer: []u8) bool {
-    const argv = args.toSlice(allocator) catch {
-        setError(error_buffer, "unable to read command line");
-        return false;
-    };
-    if (argv.len == 0) {
-        setError(error_buffer, "unable to read command line");
+pub fn parseProcessArgs(args: std.process.Args, out: *types.Options, error_buffer: []u8) bool {
+    // A Windows command line is limited to 32,767 UTF-16 units including its terminator.
+    // Each unit needs at most three WTF-8 bytes. Each argument after argv[0] consumes at
+    // least one character and one separator, including empty quoted arguments. These
+    // bounds keep the CRT-compatible iterator and every argument view on the stack, so
+    // parsing does not introduce an allocation failure absent from the C++ parser.
+    const command_line_capacity = 32_768;
+    if (args.vector.len > command_line_capacity) {
+        setError(error_buffer, "invalid parser arguments");
         return false;
     }
-    return parseArgs(argv[1..], out, error_buffer);
+    var bytes: [command_line_capacity * 3 + 1]u8 = undefined;
+    var storage = std.heap.FixedBufferAllocator.init(&bytes);
+    var iterator = args.iterateAllocator(storage.allocator()) catch
+        native.diagnostics.failFast("command line storage", native.sdk.c.ERROR_INSUFFICIENT_BUFFER);
+    defer iterator.deinit();
+    var argv: [command_line_capacity / 2 + 1][]const u8 = undefined;
+    var count: usize = 0;
+    while (iterator.next()) |argument| {
+        if (count == argv.len) native.diagnostics.failFast("command line argument count", native.sdk.c.ERROR_INSUFFICIENT_BUFFER);
+        argv[count] = argument;
+        count += 1;
+    }
+    // The CRT synthesizes argv[0] for an empty command line. Its spelling is irrelevant
+    // to the option parser, which skips the executable name in either case.
+    return parseArgs(if (count == 0) argv[0..0] else argv[1..count], out, error_buffer);
 }

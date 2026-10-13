@@ -177,8 +177,11 @@ pub const session = struct {
         /// mirror of the posted request, which is what the reference calls receive_posted; the native
         /// counter is never consulted for a state decision.
         receive_posted: bool = false,
-        /// The verdict this attempt's receive produced. It is part of the flow, so it survives from
-        /// the completion that decided it to the settlement that accounts for it.
+        /// Borrowed views of this attempt's completed receive. The transport retains both windows
+        /// until the send has also retired and the next receive is posted, so validation can follow
+        /// the same both-operations-completed boundary as the reference without copying the payload.
+        received_echo: []const u8 = &.{},
+        expected_echo: []const u8 = &.{},
         receive_corrupted: bool = false,
         attempt_accounted: bool = false,
         reconnect_after_close: bool = false,
@@ -192,6 +195,14 @@ pub const session = struct {
     /// reconnect is deliberately split in two phases: a failure emits a close, and the drain event
     /// after every outstanding operation retired arms the reconnect timer.
     pub const scheduler = struct {
+        const FixedClock = struct {
+            ticks: u64,
+
+            pub fn nowTicks(self: *const FixedClock) u64 {
+                return self.ticks;
+            }
+        };
+
         pub const Step = union(enum) {
             connect: u32,
             send: struct { index: u32, bytes: u32 },
@@ -230,6 +241,17 @@ pub const session = struct {
             if (entry.state != .connecting and entry.state != .active) return;
             entry.deadline_ticks = now +| core.timeout_ticks;
             core.armTimer(index, entry.deadline_ticks);
+        }
+
+        pub fn anchorAttemptStarted(core: *worker.Core, index: u32, now: u64) void {
+            if (index >= core.sessions.len) {
+                core.markFatal();
+                return;
+            }
+            const entry = &core.sessions[index];
+            if (entry.state != .active or entry.receive_done or entry.send_done) return;
+            entry.attempt_started_ticks = now;
+            anchorPostedTimeout(core, index, now);
         }
 
         pub fn anchorClose(core: *worker.Core, index: u32, first_close: u64) void {
@@ -285,9 +307,12 @@ pub const session = struct {
             const entry = &core.sessions[index];
             if (entry.state != .connecting) return out[0..0];
             entry.state = .active;
-            entry.active_counted = true;
+            if (!entry.active_counted) {
+                entry.active_counted = true;
+                core.active_sessions += 1;
+            }
             _ = core.timers.remove(index);
-            core.statistics.connections +|= 1;
+            core.statistics.connections +%= 1;
             return out[0..beginAttempt(core, entry, now, out, 0)];
         }
 
@@ -315,6 +340,11 @@ pub const session = struct {
         /// One completed send for the active attempt. The transport reports which operation came
         /// home; the attempt's own bookkeeping and the settlement decision are here.
         pub fn onSent(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
+            const clock = FixedClock{ .ticks = now };
+            return onSentWithClock(core, index, &clock, out);
+        }
+
+        pub fn onSentWithClock(core: *worker.Core, index: u32, clock: anytype, out: []Step) []const Step {
             if (index >= core.sessions.len) {
                 core.markFatal();
                 return out[0..0];
@@ -329,13 +359,18 @@ pub const session = struct {
             }
             entry.send_done = true;
             if (!attemptSettled(entry)) return out[0..0];
-            return settleAttempt(core, index, now, out);
+            return settleAttempt(core, index, clock, out);
         }
 
         /// One completed receive. The verdict is decided here rather than by the transport: the
         /// reference hands the received and the expected bytes to the session and lets it classify
         /// the outcome, and this does the same.
         pub fn onReceived(core: *worker.Core, index: u32, echoed: []const u8, expected: []const u8, now: u64, out: []Step) []const Step {
+            const clock = FixedClock{ .ticks = now };
+            return onReceivedWithClock(core, index, echoed, expected, &clock, out);
+        }
+
+        pub fn onReceivedWithClock(core: *worker.Core, index: u32, echoed: []const u8, expected: []const u8, clock: anytype, out: []Step) []const Step {
             if (index >= core.sessions.len) {
                 core.markFatal();
                 return out[0..0];
@@ -356,33 +391,37 @@ pub const session = struct {
             // The rule and the byte accounting sit together on purpose: a read the protocol refuses is
             // never counted as received bytes.
             if (core.options.protocol == .tcp and echoed.len != expected.len) {
-                return onTransportFailure(core, index, now, out);
+                return onTransportFailure(core, index, clock.nowTicks(), out);
             }
-            core.statistics.received_bytes +|= echoed.len;
-            // Exact comparison: by here the lengths agree for TCP, so a mismatch is a datagram whose
-            // echo does not match what was sent.
-            entry.receive_corrupted = !payload.verify(echoed, expected);
+            core.statistics.received_bytes +%= echoed.len;
+            entry.received_echo = echoed;
+            entry.expected_echo = expected;
             entry.receive_done = true;
             if (!attemptSettled(entry)) return out[0..0];
-            return settleAttempt(core, index, now, out);
+            return settleAttempt(core, index, clock, out);
         }
 
         /// Settles one completed attempt. A verified attempt counts its bytes and its echoes; a
         /// corrupted one counts the same units as corrupted and none as bytes. The latency sample is
         /// the whole attempt, which is one batch.
-        fn settleAttempt(core: *worker.Core, index: u32, now: u64, out: []Step) []const Step {
+        fn settleAttempt(core: *worker.Core, index: u32, clock: anytype, out: []Step) []const Step {
             const entry = &core.sessions[index];
             if (entry.state == .closing or entry.state == .done) return out[0..0];
+            entry.receive_corrupted = !payload.verify(entry.received_echo, entry.expected_echo);
+            const finished = clock.nowTicks();
+            core.recordLatency(finished -| entry.attempt_started_ticks);
             if (entry.receive_corrupted) {
-                core.statistics.corrupted +|= entry.requested_echoes;
+                core.statistics.corrupted +%= entry.requested_echoes;
             } else {
-                core.statistics.echoes +|= entry.requested_echoes;
-                core.statistics.bytes +|= entry.attempt_bytes;
+                core.statistics.echoes +%= entry.requested_echoes;
+                core.statistics.bytes +%= entry.attempt_bytes;
             }
-            entry.settled +|= entry.requested_echoes;
+            entry.settled +%= entry.requested_echoes;
             entry.attempt_accounted = true;
             _ = core.timers.remove(index);
-            core.recordLatency(now -| entry.attempt_started_ticks);
+            entry.received_echo = &.{};
+            entry.expected_echo = &.{};
+            const now = clock.nowTicks();
             if (core.interval_ticks != 0) {
                 entry.state = .pacing;
                 entry.send_at_ticks = now +| core.interval_ticks;
@@ -405,6 +444,8 @@ pub const session = struct {
             }
             const entry = &core.sessions[index];
             if (entry.state != .closing) return out[0..0];
+            entry.received_echo = &.{};
+            entry.expected_echo = &.{};
             _ = core.timers.remove(index);
             if (entry.reconnect_after_close and !core.stopping) {
                 entry.state = .reconnecting;
@@ -429,14 +470,16 @@ pub const session = struct {
                 if (entry.state == .done) continue;
                 if (entry.state == .active and !entry.attempt_accounted) {
                     if (core.statistics.fatal) {
-                        core.statistics.lost +|= entry.requested_echoes;
+                        core.statistics.lost +%= entry.requested_echoes;
                     } else {
-                        core.statistics.cancelled +|= entry.requested_echoes;
+                        core.statistics.cancelled +%= entry.requested_echoes;
                     }
-                    entry.settled +|= entry.requested_echoes;
+                    entry.settled +%= entry.requested_echoes;
                     entry.attempt_accounted = true;
                 }
                 entry.reconnect_after_close = false;
+                entry.received_echo = &.{};
+                entry.expected_echo = &.{};
                 if (entry.state != .closing) {
                     entry.state = .closing;
                     armClose(core, entry, now);
@@ -445,10 +488,7 @@ pub const session = struct {
         }
 
         pub fn allFinished(core: *const worker.Core) bool {
-            for (core.sessions) |entry| {
-                if (!entry.isFinished()) return false;
-            }
-            return true;
+            return core.live_sessions == 0;
         }
 
         pub fn waitTicks(core: *const worker.Core, now: u64, maximum: u64) u64 {
@@ -481,13 +521,18 @@ pub const session = struct {
             entry.send_done = false;
             entry.receive_done = false;
             entry.receive_posted = false;
+            entry.received_echo = &.{};
+            entry.expected_echo = &.{};
             entry.receive_corrupted = false;
             entry.attempt_accounted = false;
             entry.state = .active;
-            entry.active_counted = true;
+            if (!entry.active_counted) {
+                entry.active_counted = true;
+                core.active_sessions += 1;
+            }
             entry.send_at_ticks = 0;
             entry.attempt_started_ticks = now;
-            core.statistics.attempted +|= granted;
+            core.statistics.attempted +%= granted;
             entry.deadline_ticks = now +| core.timeout_ticks;
             core.armTimer(entry.index, entry.deadline_ticks);
             const length: u32 = @intCast(attempt_bytes);
@@ -504,14 +549,16 @@ pub const session = struct {
         /// the session is waiting to reconnect cannot change the tally.
         fn fail(core: *worker.Core, entry: *Session, now: u64, out: []Step, base: usize) usize {
             if (!entry.attempt_accounted) {
-                core.statistics.lost +|= entry.requested_echoes;
-                entry.settled +|= entry.requested_echoes;
+                core.statistics.lost +%= entry.requested_echoes;
+                entry.settled +%= entry.requested_echoes;
                 entry.attempt_accounted = true;
             }
-            core.statistics.network_errors +|= 1;
+            core.statistics.network_errors +%= 1;
             const will_reconnect = core.reconnect_enabled and !core.stopping;
-            if (will_reconnect) core.statistics.reconnects +|= 1;
+            if (will_reconnect) core.statistics.reconnects +%= 1;
             entry.reconnect_after_close = will_reconnect;
+            entry.received_echo = &.{};
+            entry.expected_echo = &.{};
             entry.state = .closing;
             armClose(core, entry, now);
             return core.emit(out, base, .{ .close = entry.index });
@@ -527,8 +574,22 @@ pub const session = struct {
         /// A session that cannot make progress any more is terminal: it leaves the active set, its
         /// timer is disarmed, and its socket has already been released by the close step.
         fn markDone(core: *worker.Core, entry: *Session) void {
+            if (entry.state != .done) {
+                if (core.live_sessions == 0) {
+                    core.markFatal();
+                    return;
+                }
+                core.live_sessions -= 1;
+            }
             _ = core.timers.remove(entry.index);
-            entry.active_counted = false;
+            if (entry.active_counted) {
+                if (core.active_sessions == 0) {
+                    core.markFatal();
+                    return;
+                }
+                entry.active_counted = false;
+                core.active_sessions -= 1;
+            }
             entry.deadline_ticks = 0;
             entry.send_at_ticks = 0;
             entry.reconnect_at_ticks = 0;
@@ -540,12 +601,12 @@ pub const session = struct {
         pub fn claimSessionAttempts(claimed: *u64, limit: u64, requested: u64) u64 {
             if (requested == 0) return 0;
             if (limit == 0) {
-                claimed.* +|= requested;
+                claimed.* +%= requested;
                 return requested;
             }
             if (claimed.* >= limit) return 0;
             const granted = @min(requested, limit - claimed.*);
-            claimed.* +|= granted;
+            claimed.* +%= granted;
             return granted;
         }
     };
@@ -657,6 +718,8 @@ pub const worker = struct {
     pub const Core = struct {
         index: u32 = 0,
         session_count: u32 = 0,
+        live_sessions: u32 = 0,
+        active_sessions: u32 = 0,
         options: *const types.Options = undefined,
         ticks_per_second: u64 = 1_000,
         payload_bytes: usize = 0,
@@ -693,6 +756,16 @@ pub const worker = struct {
                 .received => |received| session.scheduler.onReceived(self, received.index, received.echoed, received.expected, now, out),
                 .transport_failure => |index| session.scheduler.onTransportFailure(self, index, now, out),
                 .generation_drained => |index| session.scheduler.onGenerationDrained(self, index, now, out),
+            };
+        }
+
+        /// The production runtime supplies a statically known clock so the completion sample is
+        /// captured after validation. Pure callers can keep supplying an explicit numeric tick.
+        pub fn onEventWithClock(self: *Core, event: Event, clock: anytype, out: []Action) []const Action {
+            return switch (event) {
+                .sent => |index| session.scheduler.onSentWithClock(self, index, clock, out),
+                .received => |received| session.scheduler.onReceivedWithClock(self, received.index, received.echoed, received.expected, clock, out),
+                else => self.onEvent(event, clock.nowTicks(), out),
             };
         }
 
@@ -742,19 +815,11 @@ pub const worker = struct {
         }
 
         pub fn liveSessions(self: *const Core) u32 {
-            var count: u32 = 0;
-            for (self.sessions) |entry| {
-                if (!entry.isFinished()) count += 1;
-            }
-            return count;
+            return self.live_sessions;
         }
 
         pub fn activeSessions(self: *const Core) u32 {
-            var count: u32 = 0;
-            for (self.sessions) |entry| {
-                if (entry.active_counted) count += 1;
-            }
-            return count;
+            return self.active_sessions;
         }
 
         pub fn recordLatency(self: *Core, ticks: u64) void {
@@ -794,12 +859,14 @@ pub const worker = struct {
         notification_deliveries: u64 = 0,
         timeout_wakeups_while_outstanding: u64 = 0,
         sent_bytes: u64 = 0,
+        /// Accepted RIO posts minus received RIO completions. Cancellation never changes this
+        /// aggregate; steady-state notification arming must not scan the session array.
+        rio_outstanding: u32 = 0,
+        total_outstanding: u32 = 0,
 
         /// Operations the provider still owns across every session.
         pub fn outstanding(self: *const RioTransport) u32 {
-            var count: u32 = 0;
-            for (self.slots) |slot| count += slot.outstanding();
-            return count;
+            return self.total_outstanding;
         }
     };
 
@@ -828,8 +895,12 @@ pub const worker = struct {
 
         pub fn lifecycle(self: *const Worker) Lifecycle {
             var rio_outstanding: u32 = 0;
-            for (self.transport.slots) |slot| rio_outstanding += slot.send_outstanding + slot.receive_outstanding;
-            return .{ .phase = self.phase, .live_sessions = self.core.liveSessions(), .total_outstanding = self.transport.outstanding(), .rio_outstanding = rio_outstanding };
+            var total_outstanding: u32 = 0;
+            for (self.transport.slots) |slot| {
+                rio_outstanding += slot.send_outstanding + slot.receive_outstanding;
+                total_outstanding += slot.outstanding();
+            }
+            return .{ .phase = self.phase, .live_sessions = self.core.liveSessions(), .total_outstanding = total_outstanding, .rio_outstanding = rio_outstanding };
         }
 
         /// Partial construction has no submitted operations. A started worker must have crossed
@@ -837,9 +908,23 @@ pub const worker = struct {
         /// can be released. Keep this check inside the actual release entry point.
         pub fn requireReleasePreconditions(self: *const Worker) void {
             const state = self.lifecycle();
-            if (state.total_outstanding != 0 or state.rio_outstanding != 0) native.diagnostics.failFast("client worker release precondition", c.ERROR_IO_INCOMPLETE);
+            if (state.total_outstanding != 0 or state.rio_outstanding != 0 or self.transport.total_outstanding != 0 or self.transport.rio_outstanding != 0) native.diagnostics.failFast("client worker release precondition", c.ERROR_IO_INCOMPLETE);
+            if (state.total_outstanding != self.transport.total_outstanding or state.rio_outstanding != self.transport.rio_outstanding) native.diagnostics.failFast("client RIO outstanding count", c.ERROR_INVALID_DATA);
             if (self.started and (!self.joined or state.phase != .stopped or state.live_sessions != 0 or self.core.timers.len != 0)) {
                 native.diagnostics.failFast("client worker release precondition", c.ERROR_INVALID_STATE);
+            }
+            if (self.started) {
+                var live: u32 = 0;
+                var active: u32 = 0;
+                for (self.core.sessions) |entry| {
+                    if (!entry.isFinished()) live += 1;
+                    if (entry.active_counted) active += 1;
+                }
+                if (live != self.core.live_sessions or active != self.core.active_sessions or active != 0) native.diagnostics.failFast("client worker release precondition", c.ERROR_INVALID_STATE);
+            }
+            if (self.started and builtin.mode == .debug) {
+                if (self.transport.timeout_wakeups_while_outstanding != 0) native.diagnostics.failFast("client notification starvation", c.ERROR_INVALID_STATE);
+                if (self.transport.notification_arms < self.transport.notification_deliveries or self.transport.notification_arms - self.transport.notification_deliveries > 1) native.diagnostics.failFast("client notification accounting", c.ERROR_INVALID_STATE);
             }
         }
 
