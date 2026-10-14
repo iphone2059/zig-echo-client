@@ -30,6 +30,18 @@ pub const ExitCode = enum(u8) {
 /// The phases a worker passes through, in order.
 pub const WorkerPhase = enum(u8) { starting, running, draining, stopped };
 
+/// Copied after all workers join, before any native resources are released.
+pub const NotifySnapshot = struct {
+    worker: u32 = 0,
+    arms: u64 = 0,
+    deliveries: u64 = 0,
+    timeout_wakeups: u64 = 0,
+
+    pub fn writeLine(self: *const NotifySnapshot, protocol: Protocol, buffer: []u8) ?[]const u8 {
+        return std.fmt.bufPrint(buffer, "role=client protocol={s} worker={d} notify_arms={d} notify_deliveries={d} notify_gap={d} timeout_wakeups_while_outstanding={d}\n", .{ if (protocol == .tcp) "tcp" else "udp", self.worker, self.arms, self.deliveries, self.arms -| self.deliveries, self.timeout_wakeups }) catch null;
+    }
+};
+
 /// Normalized operations and errors are shared values, independent of a native ABI.
 pub const Operation = enum(u8) { connect = 1, send = 2, receive = 3, generation_drained = 4 };
 pub const ErrorDomain = enum { win32, winsock, allocation, capacity, invariant };
@@ -155,6 +167,17 @@ test "worker resolution follows the reference" {
     try std.testing.expectEqual(@as(u64, 32), resolvedWorkerCount(0, 32));
     try std.testing.expectEqual(@as(u64, 1), resolvedWorkerCount(0, 0));
     try std.testing.expectEqual(@as(u64, 64), resolvedWorkerCount(0, 128));
+}
+
+test "notification snapshots preserve the shared diagnostic schema" {
+    var buffer: [256]u8 = undefined;
+    var snapshot = NotifySnapshot{ .worker = 3, .arms = 7, .deliveries = 6, .timeout_wakeups = 2 };
+    const tcp = snapshot.writeLine(.tcp, &buffer) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("role=client protocol=tcp worker=3 notify_arms=7 notify_deliveries=6 notify_gap=1 timeout_wakeups_while_outstanding=2\n", tcp);
+    snapshot.deliveries = 8;
+    const udp = snapshot.writeLine(.udp, &buffer) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("role=client protocol=udp worker=3 notify_arms=7 notify_deliveries=8 notify_gap=0 timeout_wakeups_while_outstanding=2\n", udp);
+    try std.testing.expect(snapshot.writeLine(.tcp, buffer[0..8]) == null);
 }
 
 test "capacity arithmetic is checked" {

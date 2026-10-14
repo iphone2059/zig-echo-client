@@ -307,6 +307,16 @@ fn runProtocol(comptime protocol: types.Protocol, options: *const types.Options)
     for (workers[0..started]) |*wrk| joinWorker(wrk);
     // Audit the whole ownership barrier before releasing the first worker's storage.
     for (workers[0..initialized]) |*wrk| requireReleasePreconditions(wrk);
+    var notification_snapshots: [types.automatic_worker_cap]types.NotifySnapshot = undefined;
+    for (workers[0..started], 0..) |*wrk, index| {
+        notification_snapshots[index] = .{
+            .worker = @intCast(index),
+            .arms = wrk.transport.notification_arms,
+            .deliveries = wrk.transport.notification_deliveries,
+            .timeout_wakeups = wrk.transport.timeout_wakeups_while_outstanding,
+        };
+    }
+    native.diagnostics.writeSnapshots(notification_snapshots[0..started], protocol);
     var statistics = metrics.Statistics{};
     for (workers[0..initialized]) |*wrk| {
         destroyWorker(wrk);

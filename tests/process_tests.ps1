@@ -76,7 +76,7 @@ function Invoke-Client([string[]]$arguments, [int]$expectedExit, [string[]]$requ
     }
 }
 
-[void](Invoke-Client @('/h') 0 @('Usage: zig-echo-client target /p tcp|udp', 'Data I/O is always RIO'))
+[void](Invoke-Client @('/h') 0 @('Usage: zig-echo-client target /p tcp|udp', '[/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]'))
 # A usage error puts the diagnostic and the usage text on stderr and leaves stdout empty, exactly
 # as the reference does; it is not a run that reports statistics.
 [void](Invoke-Client @('127.0.0.1', '/p', 'tcp', '/d', '') 1 @() @('Invalid arguments: missing-value', 'Usage: zig-echo-client target /p tcp|udp'))

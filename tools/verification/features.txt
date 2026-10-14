@@ -1,5 +1,9 @@
 tcp
 udp
+rio
+iocp
+notify-diagnostics
 quota
 reconnect
 latency
+soak

@@ -105,8 +105,9 @@ never skipped, and the drain never runs ahead of the control path.
 - One `VirtualAlloc` per worker; TX windows first, then RX windows, each slot disjoint.
 - **One registration per TX window**: the documented RIOSend contract forbids using any other part
   of a registration while its send is pending, even when the parts would be disjoint.
-- **One registration for the whole RX region**: RIOReceive permits independent receives in
-  non-overlapping parts of one registration.
+- **One registration per RX window**: `receive_registrations`, like `send_registrations`, has one
+  entry per Slot. A Session's send and receive therefore use independent registrations and each
+  descriptor is relative to that Slot's own registration, even though one arena owns all windows.
 - A partial send re-posts the remainder of the same window, so one attempt stays one outstanding
   `RIOSend`.
 - Release order: retire outstanding operations -> close the completion queue and its notification

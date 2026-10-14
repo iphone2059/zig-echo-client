@@ -170,6 +170,8 @@ pub const sdk = struct {
         pub extern fn GetCurrentProcess() callconv(.winapi) HANDLE;
         pub extern fn TerminateProcess(HANDLE, u32) callconv(.winapi) BOOL;
         pub extern fn GetStdHandle(DWORD) callconv(.winapi) HANDLE;
+        pub extern fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: ?[*]u16, size: DWORD) callconv(.winapi) DWORD;
+        pub extern fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, security: ?*anyopaque, creation: DWORD, attributes: DWORD, template: HANDLE) callconv(.winapi) HANDLE;
         pub extern fn WriteFile(HANDLE, [*]const u8, DWORD, *DWORD, ?*OVERLAPPED) callconv(.winapi) BOOL;
         pub extern fn CloseHandle(HANDLE) callconv(.winapi) BOOL;
         pub extern fn VirtualAlloc(?*anyopaque, usize, DWORD, DWORD) callconv(.winapi) ?*anyopaque;
@@ -261,6 +263,25 @@ pub const diagnostics = struct {
         var buffer: [512]u8 = undefined;
         const output = std.fmt.bufPrint(&buffer, "{s} failed: native_error={d}\n", .{ stage, @as(i32, @bitCast(native_error)) }) catch return;
         _ = writeStderr(output);
+    }
+
+    /// Best-effort opt-in diagnostics after the collective join and ownership barrier. Failed file
+    /// output never changes standard streams or the run's exit classification.
+    pub fn writeSnapshots(values: []const types.NotifySnapshot, protocol: types.Protocol) void {
+        const name = [13:0]u16{ 'C', 'E', 'C', '_', 'D', 'I', 'A', 'G', '_', 'F', 'I', 'L', 'E' };
+        const required = c.GetEnvironmentVariableW(&name, null, 0);
+        if (required == 0 or required > 512) return;
+        var path: [512:0]u16 = @splat(0);
+        const length = c.GetEnvironmentVariableW(&name, &path, 512);
+        if (length == 0 or length >= 512) return;
+        const file = c.CreateFileW(&path, 0x40000000, 1, null, 2, 0x80, null);
+        if (file == null or file == c.INVALID_HANDLE_VALUE) return;
+        defer _ = c.CloseHandle(file);
+        for (values) |snapshot| {
+            var buffer: [256]u8 = undefined;
+            const line = snapshot.writeLine(protocol, &buffer) orelse continue;
+            if (!writeAll(file, line)) break;
+        }
     }
 
     /// A failure that leaves the process unable to make progress. The reference terminates rather
