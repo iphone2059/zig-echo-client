@@ -202,7 +202,7 @@ test "client partial RIOSend completion reposts only the unsent tail" {
     engine.handleRioResult(.tcp, &worker, .{
         .Status = 0,
         .BytesTransferred = 40,
-        .SocketContext = null,
+        .SocketContext = @ptrCast(&slots[0]),
         .RequestContext = context,
     });
     try std.testing.expectEqual(@as(u32, 40), slots[0].send_offset);
@@ -255,7 +255,7 @@ test "client close waits for both posted completions before the generation drain
     engine.handleRioResult(.tcp, &worker, .{
         .Status = 0,
         .BytesTransferred = 0,
-        .SocketContext = null,
+        .SocketContext = @ptrCast(&slots[0]),
         .RequestContext = send_context,
     });
     try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
@@ -264,7 +264,7 @@ test "client close waits for both posted completions before the generation drain
     engine.handleRioResult(.tcp, &worker, .{
         .Status = 0,
         .BytesTransferred = 0,
-        .SocketContext = null,
+        .SocketContext = @ptrCast(&slots[0]),
         .RequestContext = receive_context,
     });
     try std.testing.expectEqual(client.session.State.done, sessions[0].state);
@@ -294,7 +294,7 @@ test "client closing generation completions never steer the live state machine" 
     engine.handleRioResult(.tcp, &worker, .{
         .Status = 0,
         .BytesTransferred = 16,
-        .SocketContext = null,
+        .SocketContext = @ptrCast(&slots[0]),
         .RequestContext = stale,
     });
     try std.testing.expectEqual(@as(u32, 0), slots[0].send_outstanding);

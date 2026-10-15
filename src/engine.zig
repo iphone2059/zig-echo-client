@@ -663,6 +663,12 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
             // been acquired. The transport bounds this zero-wait drain by its ownership capacity.
             const now = self.clock.nowTicks();
             if (internal.session.scheduler.waitTicks(self.core, now, 1) == 0) self.transport.drainQueued(self);
+            // Already acquired completions settle first. A stop published during the direct CQ
+            // pass must win over old due timers, while their decision timestamp stays frozen.
+            if (stopRequested()) {
+                self.beginStop();
+                return;
+            }
             const region = self.core.acquireRegion();
             if (region.len == 0) return;
             defer self.core.releaseRegion();
@@ -950,6 +956,7 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
             const context = result.RequestContext orelse native.diagnostics.failFast("client RIO RequestContext", c.ERROR_INVALID_DATA);
             const decoded = native.completion.decode(@intFromPtr(context)) orelse native.diagnostics.failFast("client RIO RequestContext", c.ERROR_INVALID_DATA);
             const slot = self.slotAt(decoded.index);
+            if (result.SocketContext != @as(?*anyopaque, @ptrCast(slot))) native.diagnostics.failFast("client RIO SocketContext identity", c.ERROR_INVALID_DATA);
             // No old generation may retain ownership when a new one is created. A mismatched
             // record is corruption, not permission to decrement the current generation's ledger.
             if (decoded.generation != slot.generation or decoded.slot != native.completion.no_send_slot) native.diagnostics.failFast("client RIO completion ownership", c.ERROR_INVALID_DATA);
