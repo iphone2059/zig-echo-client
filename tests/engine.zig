@@ -798,3 +798,119 @@ test "a send failure after a receive loses the whole unsettled batch" {
     try std.testing.expectEqual(@as(u64, 2), worker.core.statistics.lost);
     try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.network_errors);
 }
+
+/// A clock with no provider behind it: the arbitration only reads ticks.
+const RecorderClock = struct {
+    ticks: u64 = 0,
+
+    pub fn nowTicks(self: *const RecorderClock) u64 {
+        return self.ticks;
+    }
+};
+
+/// A transport recorder with no provider objects. Its direct CQ pass publishes the process stop
+/// exactly when the fixture asks for it, which is the ordering the runtime has to arbitrate.
+const RecorderTransport = struct {
+    drain_calls: usize = 0,
+    closes: usize = 0,
+    stop_inside_drain: bool = false,
+
+    pub fn drainQueued(self: *RecorderTransport, runtime: anytype) void {
+        _ = runtime;
+        self.drain_calls += 1;
+        if (self.stop_inside_drain) engine.requestStop();
+    }
+
+    pub fn maybeArm(_: *RecorderTransport) void {}
+
+    pub fn connect(_: *RecorderTransport, _: u32) engine.PostResult {
+        return .{ .success = .{} };
+    }
+
+    pub fn send(_: *RecorderTransport, _: u32, _: u32) engine.PostResult {
+        return .{ .success = .{} };
+    }
+
+    pub fn receive(_: *RecorderTransport, _: u32, _: u32) engine.PostResult {
+        return .{ .success = .{} };
+    }
+
+    pub fn close(self: *RecorderTransport, _: u32) engine.PostResult {
+        self.closes += 1;
+        return .{ .success = .{} };
+    }
+
+    pub fn drainTimeout(_: *RecorderTransport, _: u32) engine.PostResult {
+        return .{ .success = .{} };
+    }
+
+    pub fn sentBytes(_: *RecorderTransport) u64 {
+        return 0;
+    }
+
+    pub fn reportFailure(_: *RecorderTransport, _: client.types.Failure) void {}
+
+    pub fn invariantFailure(_: *RecorderTransport, _: []const u8) noreturn {
+        unreachable;
+    }
+
+    pub fn isLive(_: *RecorderTransport, _: client.worker.Completion) bool {
+        return true;
+    }
+
+    pub fn connected(_: *RecorderTransport, _: u32, _: u32) client.types.Result(void) {
+        return .{ .success = {} };
+    }
+
+    pub fn expected(_: *RecorderTransport, _: u32, _: usize) []const u8 {
+        return &.{};
+    }
+
+    pub fn received(_: *RecorderTransport, _: u32, _: u32, _: u32) []const u8 {
+        return &.{};
+    }
+};
+
+test "a stop published during the direct CQ pass wins over a due timeout" {
+    // The decision timestamp is sampled before the pass, so the pass must settle first and a stop
+    // published inside it must win over the timeout that was already due; the same pass without a
+    // stop still expires the attempt. This is the Zig counterpart of the C++ runtime pair
+    // cec_runtime_test_stop_during_direct_drain.
+    for ([_]bool{ false, true }) |stop_inside_drain| {
+        engine.clearControl();
+        var sessions: [1]Session = .{.{}};
+        var slots: [1]client.native.transport.Slot = @splat(.{});
+        var steps: [4]scheduler.Step = undefined;
+        var nodes: [1]timer.Node = undefined;
+        var positions: [1]u32 = undefined;
+        const options = client.types.Options{ .protocol = .tcp, .reconnect_seconds = 0 };
+        var worker = buildWorker(&sessions, &slots, &steps, &nodes, &positions, &options, 16);
+        sessions[0].state = .active;
+        sessions[0].requested_echoes = 1;
+        worker.core.statistics.attempted = 1;
+        // The attempt deadline is anchored at tick zero, so it is already due for the clock below.
+        scheduler.anchorAttemptStarted(&worker.core, 0, 0);
+        var clock = RecorderClock{ .ticks = worker.core.timeout_ticks * 2 };
+        var transport = RecorderTransport{ .stop_inside_drain = stop_inside_drain };
+        var runtime = engine.WorkerRuntime(RecorderTransport, RecorderClock){
+            .core = &worker.core,
+            .transport = &transport,
+            .clock = &clock,
+        };
+        runtime.poll();
+        try std.testing.expectEqual(@as(usize, 1), transport.drain_calls);
+        if (stop_inside_drain) {
+            try std.testing.expect(worker.core.stopping);
+            try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.lost);
+            try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.network_errors);
+            try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
+        } else {
+            try std.testing.expect(!worker.core.stopping);
+            try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.lost);
+            try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.network_errors);
+        }
+        try std.testing.expectEqual(@as(usize, 1), transport.closes);
+    }
+    engine.clearControl();
+}
+
