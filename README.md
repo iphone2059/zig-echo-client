@@ -32,7 +32,7 @@ Start an echo server separately, then run a finite test without `/w`:
   /report 1 /stats
 ```
 
-`/n` is the total logical echo count across all sessions. `/k` batches that many TCP messages into one send/receive attempt; the final batch may be smaller. `RIO_MSG_WAITALL` waits for the whole TCP batch. Partial sends are reposted against the remaining registered buffer region. `ConnectEx` is associated with the worker IOCP before connection; the RIO request queue is created only after a successful connection completion.
+`/n` is the per-session logical echo count: every session claims its own quota independently, and a session that failed or reconnected never gets its claimed attempts back. `/k` batches that many TCP messages into one send/receive attempt; the final batch may be smaller. `RIO_MSG_WAITALL` waits for the whole TCP batch. Partial sends are reposted against the remaining registered buffer region. `ConnectEx` is associated with the worker IOCP before connection; the RIO request queue is created only after a successful connection completion.
 
 ## UDP example
 
