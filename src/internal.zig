@@ -947,7 +947,10 @@ pub const worker = struct {
                 }
                 if (live != self.core.live_sessions or active != self.core.active_sessions or active != 0) native.diagnostics.failFast("client worker release precondition", c.ERROR_INVALID_STATE);
             }
-            if (self.started and builtin.mode == .debug) {
+            // Notification ownership is an invariant in every build, not a diagnostic: a queue that
+            // was armed for work which then never arrived is a defect in ReleaseFast too, and the
+            // server enforces the same two conditions unconditionally.
+            if (self.started) {
                 if (self.transport.timeout_wakeups_while_outstanding != 0) native.diagnostics.failFast("client notification starvation", c.ERROR_INVALID_STATE);
                 if (self.transport.notification_arms < self.transport.notification_deliveries or self.transport.notification_arms - self.transport.notification_deliveries > 1) native.diagnostics.failFast("client notification accounting", c.ERROR_INVALID_STATE);
             }
