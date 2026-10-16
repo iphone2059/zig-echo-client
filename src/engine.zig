@@ -670,7 +670,7 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
             // session is closing, so the timer heap still has to be arbitrated: the drain deadline it
             // holds is what turns a completion the provider never delivers into the named
             // "client generation drain" fail-fast instead of a worker that waits forever.
-            if (stopRequested() and !self.core.stopping) {
+            if (stopRequested() and !self.core.isStopping()) {
                 self.beginStop();
                 return;
             }
@@ -694,11 +694,12 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
                 const wait_ms: u32 = @intCast(@min(self.clock.ticksToWaitMilliseconds(wait_ticks), std.math.maxInt(u32)));
                 self.transport.waitAndDrain(wait_ms, self);
                 self.core.statistics.sent_bytes = self.transport.sentBytes();
-                if (stopRequested() or self.core.stopping or self.core.statistics.fatal) break;
+                if (stopRequested() or self.core.isStopping() or self.core.statistics.fatal) break;
                 self.poll();
                 self.transport.maybeArm();
             }
             if (self.core.statistics.fatal) requestFatal();
+            self.core.markDraining();
             if (self.owner) |owner| owner.phase = .draining;
             self.shutdown();
             if (self.owner) |owner| {
@@ -710,7 +711,7 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
         /// A stop packet settles business accounting and starts native cancellation immediately.
         /// Repeated packets and the final shutdown share this idempotent entry point.
         pub fn beginStop(self: *Self) void {
-            if (self.core.stopping) return;
+            if (self.core.isStopping()) return;
             if (fatalRequested()) self.core.markFatal();
             internal.session.scheduler.beginShutdownAt(self.core, self.clock.nowTicks());
             if (self.owner) |owner| owner.publish(self.clock.nowTicks(), true);
@@ -719,6 +720,9 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
                 const action = [_]internal.worker.Action{.{ .close = entry.index }};
                 self.dispatch(&action);
             }
+            // Cancellation has been issued for every live generation, and each generation kept its
+            // first drain deadline, so the worker is now draining rather than merely stopping.
+            self.core.markCancelIssued();
         }
 
         pub fn shutdown(self: *Self) void {
@@ -736,6 +740,8 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
                 if (self.owner) |owner| owner.publish(self.clock.nowTicks(), false);
                 self.transport.maybeArm();
             }
+            // Every generation retired: this worker is quiescent and may leave its loop and join.
+            self.core.markQuiescent();
             self.transport.retireNotifications();
         }
     };
@@ -1095,7 +1101,7 @@ pub fn RioAdapter(comptime protocol: types.Protocol) type {
             } else if (overlapped == null) {
                 if (ok == c.FALSE) {
                     if (code != c.WAIT_TIMEOUT) native.diagnostics.failFast("GetQueuedCompletionStatus(client)", code);
-                    if (!runtime.core.stopping and self.transport.rio_outstanding != 0 and !self.transport.completion_queue.armed) self.transport.timeout_wakeups_while_outstanding +%= 1;
+                    if (!runtime.core.isStopping() and self.transport.rio_outstanding != 0 and !self.transport.completion_queue.armed) self.transport.timeout_wakeups_while_outstanding +%= 1;
                     if (stopRequested()) runtime.beginStop();
                     return false;
                 } else if (key != stop_key) {

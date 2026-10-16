@@ -30,6 +30,24 @@ pub const ExitCode = enum(u8) {
 /// The phases a worker passes through, in order.
 pub const WorkerPhase = enum(u8) { starting, running, draining, stopped };
 
+/// The stop sequence a worker passes through, in order. A stop is published atomically, then
+/// admission closes, cancellation is issued, the worker drains whatever the provider still owns,
+/// and only then is it quiescent. One ordered phase replaces the booleans that used to imply each
+/// other, so every reader asks the same question. Fatal stays a separate classification
+/// (statistics.fatal), not a phase: a fatal run still walks the same sequence.
+pub const ShutdownPhase = enum(u8) {
+    /// Normal operation: attempts are admitted and run.
+    running,
+    /// A stop was applied: no new attempt may start and no reconnect is scheduled.
+    admission_closed,
+    /// Cancellation was issued for every live generation: sockets closed, drain deadlines armed.
+    cancel_issued,
+    /// Waiting for provider ownership to retire before this worker may leave.
+    draining,
+    /// Every generation retired; the worker may leave its loop and join.
+    quiescent,
+};
+
 /// Copied after all workers join, before any native resources are released.
 pub const NotifySnapshot = struct {
     worker: u32 = 0,

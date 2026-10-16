@@ -447,7 +447,7 @@ pub const session = struct {
             entry.received_echo = &.{};
             entry.expected_echo = &.{};
             _ = core.timers.remove(index);
-            if (entry.reconnect_after_close and !core.stopping) {
+            if (entry.reconnect_after_close and !core.isStopping()) {
                 entry.state = .reconnecting;
                 entry.reconnect_at_ticks = now +| core.reconnect_ticks;
                 core.armTimer(index, entry.reconnect_at_ticks);
@@ -464,8 +464,8 @@ pub const session = struct {
         }
 
         pub fn beginShutdownAt(core: *worker.Core, now: u64) void {
-            if (core.stopping) return;
-            core.stopping = true;
+            if (core.isStopping()) return;
+            core.markAdmissionClosed();
             for (core.sessions) |*entry| {
                 if (entry.state == .done) continue;
                 if (entry.state == .active and !entry.attempt_accounted) {
@@ -554,7 +554,7 @@ pub const session = struct {
                 entry.attempt_accounted = true;
             }
             core.statistics.network_errors +%= 1;
-            const will_reconnect = core.reconnect_enabled and !core.stopping;
+            const will_reconnect = core.reconnect_enabled and !core.isStopping();
             if (will_reconnect) core.statistics.reconnects +%= 1;
             entry.reconnect_after_close = will_reconnect;
             entry.received_echo = &.{};
@@ -743,7 +743,32 @@ pub const worker = struct {
         timer_positions: []u32 = &.{},
         timers: timer.Heap = .{},
 
-        stopping: bool = false,
+        /// The stop sequence this worker has reached.
+        shutdown: types.ShutdownPhase = .running,
+
+        pub fn isStopping(self: *const Core) bool {
+            return self.shutdown != .running;
+        }
+
+        pub fn markAdmissionClosed(self: *Core) void {
+            if (self.shutdown == .running) self.shutdown = .admission_closed;
+        }
+
+        pub fn markCancelIssued(self: *Core) void {
+            if (@intFromEnum(self.shutdown) < @intFromEnum(types.ShutdownPhase.cancel_issued)) {
+                self.shutdown = .cancel_issued;
+            }
+        }
+
+        pub fn markDraining(self: *Core) void {
+            if (@intFromEnum(self.shutdown) < @intFromEnum(types.ShutdownPhase.draining)) {
+                self.shutdown = .draining;
+            }
+        }
+
+        pub fn markQuiescent(self: *Core) void {
+            self.shutdown = .quiescent;
+        }
 
         pub fn markFatal(self: *Core) void {
             self.statistics.fatal = true;

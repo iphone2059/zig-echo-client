@@ -900,12 +900,12 @@ test "a stop published during the direct CQ pass wins over a due timeout" {
         runtime.poll();
         try std.testing.expectEqual(@as(usize, 1), transport.drain_calls);
         if (stop_inside_drain) {
-            try std.testing.expect(worker.core.stopping);
+            try std.testing.expect(worker.core.isStopping());
             try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.lost);
             try std.testing.expectEqual(@as(u64, 0), worker.core.statistics.network_errors);
             try std.testing.expectEqual(client.session.State.closing, sessions[0].state);
         } else {
-            try std.testing.expect(!worker.core.stopping);
+            try std.testing.expect(!worker.core.isStopping());
             try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.lost);
             try std.testing.expectEqual(@as(u64, 1), worker.core.statistics.network_errors);
         }
