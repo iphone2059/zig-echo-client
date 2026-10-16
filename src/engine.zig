@@ -665,7 +665,12 @@ pub fn WorkerRuntime(comptime Transport: type, comptime Clock: type) type {
             if (internal.session.scheduler.waitTicks(self.core, now, 1) == 0) self.transport.drainQueued(self);
             // Already acquired completions settle first. A stop published during the direct CQ
             // pass must win over old due timers, while their decision timestamp stays frozen.
-            if (stopRequested()) {
+            //
+            // Only a stop that has not been applied yet returns here. Once beginStop has run, every
+            // session is closing, so the timer heap still has to be arbitrated: the drain deadline it
+            // holds is what turns a completion the provider never delivers into the named
+            // "client generation drain" fail-fast instead of a worker that waits forever.
+            if (stopRequested() and !self.core.stopping) {
                 self.beginStop();
                 return;
             }
